@@ -1,0 +1,13 @@
+/Binaries/
+/Intermediate/
+/Build/VS2022/
+/Build/Xcode/
+/.vs/
+/out/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+__pycache__/
+*.pyc
+.DS_Store
