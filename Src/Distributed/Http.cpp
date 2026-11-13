@@ -60,12 +60,55 @@ void Timeout(Socket socket, int seconds)
 #endif
 }
 
-void Send(Socket socket, const void* data, std::size_t length)
+void Send(Socket socket, const void* data, std::size_t length, const CancellationProbe& cancelled = {},
+          int timeoutSeconds = 600)
 {
+    // A writable socket may still block on a multi-gigabyte send. Keep each
+    // operation nonblocking so cancellation also covers upload and readback.
+    struct RestoreBlocking
+    {
+        Socket Value;
+#ifndef _WIN32
+        int Flags;
+#endif
+        ~RestoreBlocking()
+        {
+#ifdef _WIN32
+            u_long mode = 0;
+            ioctlsocket(Native(Value), FIONBIO, &mode);
+#else
+            fcntl(Native(Value), F_SETFL, Flags);
+#endif
+        }
+    };
+#ifdef _WIN32
+    u_long mode = 1;
+    if (ioctlsocket(Native(socket), FIONBIO, &mode)) throw std::runtime_error("Cannot configure HTTP upload");
+    RestoreBlocking restore{socket};
+#else
+    const int previousFlags = fcntl(Native(socket), F_GETFL, 0);
+    if (previousFlags < 0 || fcntl(Native(socket), F_SETFL, previousFlags | O_NONBLOCK) < 0)
+        throw std::runtime_error("Cannot configure HTTP upload");
+    RestoreBlocking restore{socket, previousFlags};
+#endif
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
+    constexpr size_t SendChunkBytes = 64 * 1024;
+    constexpr long PollMicroseconds = 200000;
     auto cursor = static_cast<const char*>(data);
     while (length)
     {
-        const int count = static_cast<int>(std::min<std::size_t>(length, INT_MAX));
+        if (cancelled && cancelled()) throw std::runtime_error("HTTP request cancelled");
+        if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("HTTP send timed out");
+        fd_set writable;
+        FD_ZERO(&writable); FD_SET(Native(socket), &writable);
+        timeval delay{0, PollMicroseconds};
+        const int ready = select(static_cast<int>(Native(socket) + 1), nullptr, &writable, nullptr, &delay);
+#ifndef _WIN32
+        if (ready < 0 && errno == EINTR) continue;
+#endif
+        if (ready < 0) throw std::runtime_error("HTTP connection failed while sending");
+        if (!ready) continue;
+        const int count = static_cast<int>(std::min<std::size_t>(length, SendChunkBytes));
 #ifdef MSG_NOSIGNAL
         const int flags = MSG_NOSIGNAL;
 #else
@@ -73,7 +116,9 @@ void Send(Socket socket, const void* data, std::size_t length)
 #endif
         const int sent = static_cast<int>(send(Native(socket), cursor, count, flags));
 #ifndef _WIN32
-        if (sent < 0 && errno == EINTR) continue;
+        if (sent < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+#else
+        if (sent < 0 && WSAGetLastError() == WSAEWOULDBLOCK) continue;
 #endif
         if (sent <= 0) throw std::runtime_error("HTTP connection closed while sending");
         cursor += sent;
@@ -119,7 +164,7 @@ Endpoint ParseEndpoint(const std::string& text)
     return result;
 }
 
-Socket Connect(const Endpoint& endpoint, int timeoutSeconds, const std::atomic<bool>* cancelled)
+Socket Connect(const Endpoint& endpoint, int timeoutSeconds, const CancellationProbe& cancelled)
 {
     Initialize();
     addrinfo hints{};
@@ -145,7 +190,7 @@ Socket Connect(const Endpoint& endpoint, int timeoutSeconds, const std::atomic<b
         if (!ready)
         {
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(std::min(3, timeoutSeconds));
-            while (std::chrono::steady_clock::now() < deadline && !(cancelled && cancelled->load()))
+            while (std::chrono::steady_clock::now() < deadline && !(cancelled && cancelled()))
             {
                 fd_set writable, errors;
                 FD_ZERO(&writable); FD_ZERO(&errors);
@@ -254,13 +299,14 @@ Socket Accept(Socket listener)
     return socket;
 }
 
-Message Read(Socket socket, std::size_t maximumBody, const std::atomic<bool>* cancelled, int timeoutSeconds)
+Message ReadRequest(Socket socket, std::size_t maximumBody, const HeaderHandler& beforeBody,
+                    const CancellationProbe& cancelled, int timeoutSeconds)
 {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeoutSeconds);
     const auto receive = [&](char* destination, int size) {
         for (;;)
         {
-            if (cancelled && cancelled->load()) throw std::runtime_error("HTTP request cancelled");
+            if (cancelled && cancelled()) throw std::runtime_error("HTTP request cancelled");
             if (std::chrono::steady_clock::now() >= deadline) throw std::runtime_error("HTTP request timed out");
             fd_set readable;
             FD_ZERO(&readable); FD_SET(Native(socket), &readable);
@@ -310,8 +356,14 @@ Message Read(Socket socket, std::size_t maximumBody, const std::atomic<bool>* ca
         length = static_cast<std::size_t>(parsed);
     }
     const auto first = pending.begin() + static_cast<std::ptrdiff_t>(headerEnd + 4);
+    if (size_t(pending.end() - first) > length) throw std::runtime_error("Unexpected HTTP body bytes");
+    int bodyTimeout = timeoutSeconds;
+    if (beforeBody) beforeBody(result, length, bodyTimeout);
+    if (bodyTimeout <= 0) throw std::runtime_error("Invalid HTTP body timeout");
+    deadline = std::chrono::steady_clock::now() + std::chrono::seconds(bodyTimeout);
+    if (cancelled && cancelled()) throw std::runtime_error("HTTP request cancelled");
+    result.Body.reserve(length);
     result.Body.assign(first, pending.end());
-    if (result.Body.size() > length) throw std::runtime_error("Unexpected HTTP body bytes");
     while (result.Body.size() < length)
     {
         const int wanted = static_cast<int>(std::min<std::size_t>(sizeof(buffer), length - result.Body.size()));
@@ -321,13 +373,18 @@ Message Read(Socket socket, std::size_t maximumBody, const std::atomic<bool>* ca
     }
     return result;
 }
+Message Read(Socket socket, std::size_t maximumBody, const std::atomic<bool>* cancelled, int timeoutSeconds)
+{
+    return ReadRequest(socket, maximumBody, {}, [=] { return cancelled && cancelled->load(); }, timeoutSeconds);
+}
 
-void Reply(Socket socket, int status, const Bytes& body, const std::string& type)
+void Reply(Socket socket, int status, const Bytes& body, const std::string& type,
+           const CancellationProbe& cancelled)
 {
     const std::string header = "HTTP/1.1 " + std::to_string(status) + " Arvo\r\nContent-Length: " +
         std::to_string(body.size()) + "\r\nContent-Type: " + type + "\r\nConnection: close\r\n\r\n";
-    Send(socket, header.data(), header.size());
-    Send(socket, body.data(), body.size());
+    Send(socket, header.data(), header.size(), cancelled);
+    Send(socket, body.data(), body.size(), cancelled);
 }
 
 void Reply(Socket socket, int status, const std::string& body)
@@ -335,20 +392,27 @@ void Reply(Socket socket, int status, const std::string& body)
     Reply(socket, status, Bytes(body.begin(), body.end()));
 }
 
-Response Request(const std::string& endpoint, const std::string& method,
-                 const std::string& path, const std::string& body,
-                 const std::string& token, int timeoutSeconds, const std::atomic<bool>* cancelled)
+namespace
+{
+Response RequestData(const std::string& endpoint, const std::string& method,
+                     const std::string& path, const void* data, size_t bytes, const char* contentType,
+                     const std::string& token, int timeoutSeconds, const CancellationProbe& cancelled,
+                     std::size_t maximumResponseBytes, const std::string& jobId)
 {
     const Endpoint parsed = ParseEndpoint(endpoint);
     if (token.find_first_of("\r\n") != std::string::npos) throw std::runtime_error("Invalid bearer token");
+    if (jobId.size() > 128 || jobId.find_first_of("\r\n") != std::string::npos)
+        throw std::runtime_error("Invalid HTTP job identifier");
+    // Connect already polls cancellation; use the same probe for all I/O stages.
     SocketGuard socket{Connect(parsed, timeoutSeconds, cancelled)};
     const std::string host = parsed.Host.find(':') == std::string::npos ? parsed.Host : "[" + parsed.Host + "]";
     const std::string header = method + " " + parsed.Prefix + path + " HTTP/1.1\r\nHost: " + host + ":" + parsed.Port +
-        "\r\nContent-Length: " + std::to_string(body.size()) + "\r\nContent-Type: text/plain\r\nConnection: close\r\n" +
+        "\r\nContent-Length: " + std::to_string(bytes) + "\r\nContent-Type: " + contentType + "\r\nConnection: close\r\n" +
+        (jobId.empty() ? std::string{} : "X-Arvo-Job: " + jobId + "\r\n") +
         (token.empty() ? std::string{} : "Authorization: Bearer " + token + "\r\n") + "\r\n";
-    Send(socket.Value, header.data(), header.size());
-    Send(socket.Value, body.data(), body.size());
-    auto message = Read(socket.Value, 16 * 1024 * 1024, cancelled, timeoutSeconds);
+    Send(socket.Value, header.data(), header.size(), cancelled, timeoutSeconds);
+    Send(socket.Value, data, bytes, cancelled, timeoutSeconds);
+    auto message = ReadRequest(socket.Value, maximumResponseBytes, {}, cancelled, timeoutSeconds);
     std::istringstream status(message.FirstLine);
     std::string version;
     Response result;
@@ -356,6 +420,22 @@ Response Request(const std::string& endpoint, const std::string& method,
     if (version != "HTTP/1.1" && version != "HTTP/1.0") throw std::runtime_error("Invalid HTTP response");
     result.Body = std::move(message.Body);
     return result;
+}
+} // namespace
+Response Request(const std::string& endpoint, const std::string& method, const std::string& path,
+                 const std::string& body, const std::string& token, int timeoutSeconds,
+                 const std::atomic<bool>* cancelled, std::size_t maximumResponseBytes)
+{
+    return RequestData(endpoint, method, path, body.data(), body.size(), "text/plain", token,
+        timeoutSeconds, [=] { return cancelled && cancelled->load(); }, maximumResponseBytes, {});
+}
+Response RequestBinary(const std::string& endpoint, const std::string& method, const std::string& path,
+                       const Bytes& body, const std::string& token, int timeoutSeconds,
+                       const CancellationProbe& cancelled, std::size_t maximumResponseBytes,
+                       const std::string& jobId)
+{
+    return RequestData(endpoint, method, path, body.data(), body.size(), "application/octet-stream", token,
+                       timeoutSeconds, cancelled, maximumResponseBytes, jobId);
 }
 
 std::string Text(const Bytes& bytes) { return {bytes.begin(), bytes.end()}; }

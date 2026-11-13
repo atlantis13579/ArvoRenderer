@@ -24,7 +24,7 @@ namespace
 {
 void CheckCancellation(const std::function<bool()>& cancelled)
 {
-    if (cancelled && cancelled()) throw std::runtime_error("PNG save cancelled");
+    if (cancelled && cancelled()) throw std::runtime_error("output save cancelled");
 }
 
 class TemporaryFile
@@ -50,15 +50,15 @@ public:
             if (Handle_ != INVALID_HANDLE_VALUE) return;
             const auto error = GetLastError();
             if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
-                throw std::system_error(static_cast<int>(error), std::system_category(), "Cannot create temporary PNG");
+                throw std::system_error(static_cast<int>(error), std::system_category(), "Cannot create temporary output");
 #else
             Handle_ = open(Path_.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
             if (Handle_ >= 0) return;
             if (errno != EEXIST)
-                throw std::system_error(errno, std::generic_category(), "Cannot create temporary PNG");
+                throw std::system_error(errno, std::generic_category(), "Cannot create temporary output");
 #endif
         }
-        throw std::runtime_error("Cannot reserve a unique temporary PNG path");
+        throw std::runtime_error("Cannot reserve a unique temporary output path");
     }
 
     TemporaryFile(const TemporaryFile&) = delete;
@@ -83,12 +83,12 @@ public:
 #ifdef _WIN32
             DWORD written = 0;
             if (!WriteFile(Handle_, cursor, static_cast<DWORD>(count), &written, nullptr) || written == 0)
-                throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Writing PNG failed");
+                throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Writing output failed");
 #else
             const auto written = write(Handle_, cursor, count);
             if (written < 0 && errno == EINTR) continue;
             if (written <= 0)
-                throw std::system_error(errno, std::generic_category(), "Writing PNG failed");
+                throw std::system_error(errno, std::generic_category(), "Writing output failed");
 #endif
             cursor += written;
             length -= static_cast<std::size_t>(written);
@@ -100,7 +100,7 @@ public:
         CheckCancellation(cancelled);
 #ifdef _WIN32
         if (!FlushFileBuffers(Handle_))
-            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Flushing PNG failed");
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Flushing output failed");
         CloseHandleOnly();
         for (unsigned attempt = 0; ; ++attempt)
         {
@@ -109,16 +109,16 @@ public:
             const auto error = GetLastError();
             // Concurrent atomic replacements can briefly hold the destination entry.
             if (attempt == 39 || (error != ERROR_SHARING_VIOLATION && error != ERROR_ACCESS_DENIED))
-                throw std::system_error(static_cast<int>(error), std::system_category(), "Publishing PNG failed");
+                throw std::system_error(static_cast<int>(error), std::system_category(), "Publishing output failed");
             Sleep(5);
         }
 #else
         if (fsync(Handle_) != 0)
-            throw std::system_error(errno, std::generic_category(), "Flushing PNG failed");
+            throw std::system_error(errno, std::generic_category(), "Flushing output failed");
         const int handle = Handle_;
         Handle_ = -1;
         if (close(handle) != 0)
-            throw std::system_error(errno, std::generic_category(), "Closing PNG failed");
+            throw std::system_error(errno, std::generic_category(), "Closing output failed");
         CheckCancellation(cancelled);
         std::filesystem::rename(Path_, target);
 #endif
@@ -237,6 +237,20 @@ void WritePng(const std::filesystem::path& path, std::uint32_t width,
     BigEndian(zlib, (b << 16) | a);
     Chunk(stream, "IDAT", zlib);
     Chunk(stream, "IEND", {});
+    stream.Publish(path, cancelled);
+}
+void WriteBinaryAtomic(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
+                       const std::function<bool()>& cancelled)
+{
+    CheckCancellation(cancelled);
+    if (!path.parent_path().empty()) std::filesystem::create_directories(path.parent_path());
+    TemporaryFile stream(path);
+    constexpr size_t TransferBlockBytes = 64 * 1024;
+    for (size_t at = 0; at < bytes.size(); at += TransferBlockBytes)
+    {
+        CheckCancellation(cancelled);
+        stream.Write(bytes.data() + at, std::min(TransferBlockBytes, bytes.size() - at));
+    }
     stream.Publish(path, cancelled);
 }
 } // namespace Arvo::Distributed

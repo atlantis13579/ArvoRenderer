@@ -216,8 +216,8 @@ NSString* StringFromUtf8(const std::string& text)
         Arvo::Editor::RegisterModuleAdapters(*editor);
         editor->SetPickHandler(Arvo::Editor::CreatePickHandler());
 
-        // macOS uses a native Metal presentation surface.
-        editor->SelectBackend("renderer.metal");
+        // Metal presents the editor UI on macOS. Scene transport is offline-only;
+        // the DX11/DXR realtime preview choices require Windows.
         const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
         editor->ResizeViewport(
             static_cast<std::uint32_t>(std::max(viewport.Width, 1.0f)),
@@ -225,6 +225,7 @@ NSString* StringFromUtf8(const std::string& text)
 
         Presenter_ = std::move(presenter);
         Editor_ = std::move(editor);
+        RenderPanel_.StartLocalWorkers();
         PresentationError_.clear();
         LastTick_ = std::chrono::steady_clock::now();
         Running_ = YES;
@@ -253,7 +254,7 @@ NSString* StringFromUtf8(const std::string& text)
 
 - (void)stopEditor
 {
-    RenderPanel_.Cancel();
+    RenderPanel_.StopLocalWorkers();
     Running_ = NO;
     if (Editor_ != nullptr)
     {

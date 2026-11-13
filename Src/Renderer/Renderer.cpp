@@ -1,4 +1,5 @@
 #include "Renderer/Renderer.h"
+#include "Maths/Matrix4.h"
 
 #include <algorithm>
 #include <cmath>
@@ -252,6 +253,7 @@ namespace Arvo::Renderer
 		if (m_RHI && m_RHI->IsInitialized())
 		{
 			ClearScene();
+			DestroyMeshResources(m_MediumBackground);
 			if (m_ShadowMap)
 			{
 				m_RHI->DestroyTexture(m_ShadowMap);
@@ -264,6 +266,8 @@ namespace Arvo::Renderer
 			m_TextureCache.clear();
 		}
 		m_ShadowMap = {};
+		m_MediumBackground = {};
+		m_Medium = {};
 		m_LastFrameCapture = {};
 		m_Initialized = false;
 	}
@@ -494,6 +498,17 @@ namespace Arvo::Renderer
 	const LightingState& Renderer::GetLighting() const
 	{
 		return m_Lighting;
+	}
+
+	bool Renderer::SetMedium(const RayTracing::MediumOptions& medium)
+	{
+		std::string error;
+		if (!RayTracing::ValidateMediumOptions(RayTracing::Algorithm::PathTracing, medium, error))
+			return Fail(error.c_str());
+		if (medium.Enabled && (!m_RHI || m_RHI->GetBackend() != RHIBackend::DX11))
+			return Fail("This raster backend does not implement participating media");
+		m_Medium = medium;
+		return true;
 	}
 
 	void Renderer::SetViewProjection(const Matrix4& viewProjection)
@@ -864,6 +879,7 @@ namespace Arvo::Renderer
 		PipelineState& pipeline) const
 	{
 		const MaterialData& material = mesh.Mesh.Material;
+		pipeline.Scattering = material.Scattering;
 		pipeline.MaterialDiffuseColor = material.BaseColor;
 		pipeline.MaterialAmbientColor = material.AmbientColor;
 		pipeline.MaterialSpecularColor = material.SpecularColor;
@@ -876,6 +892,7 @@ namespace Arvo::Renderer
 		pipeline.NormalTexture = mesh.NormalTexture;
 		pipeline.OpacityTexture = mesh.OpacityTexture;
 		pipeline.Lighting = m_Lighting;
+		pipeline.Medium = m_Medium;
 	}
 
 	bool Renderer::RenderShadowPass()
@@ -924,6 +941,7 @@ namespace Arvo::Renderer
 		{
 			return Fail(m_RHI->GetLastError().c_str());
 		}
+		if (m_Medium.Enabled && !RenderMediumBackground()) return false;
 
 		std::vector<const MeshResource*> opaqueMeshes;
 		std::vector<const MeshResource*> translucentMeshes;
@@ -1534,6 +1552,34 @@ namespace Arvo::Renderer
 					255.0f));
 		}
 		capture.Statistics.OutlineDrawCallCount = outlinedMeshCount;
+	}
+
+	bool Renderer::RenderMediumBackground()
+	{
+		if (!m_MediumBackground.VertexBuffer)
+		{
+			// Procedural clip-space triangle, owned separately from scene meshes.
+			MeshData triangle;
+			triangle.Id = "Renderer.MediumBackground";
+			triangle.Vertices.resize(3);
+			triangle.Vertices[0].Position = {-1, -1, 0};
+			triangle.Vertices[1].Position = {3, -1, 0};
+			triangle.Vertices[2].Position = {-1, 3, 0};
+			triangle.Indices = {0, 1, 2};
+			if (!CreateMeshResources(triangle, m_MediumBackground)) return false;
+		}
+		Maths::Matrix4 inverse;
+		if (!Maths::Matrix4(m_ViewProjection.Values).Inverse(inverse))
+			return Fail("Medium background requires an invertible view projection");
+		std::copy_n(inverse.Data(), m_MediumBackground.Mesh.WorldTransform.Values.size(),
+			m_MediumBackground.Mesh.WorldTransform.Values.begin());
+		PipelineState pipeline;
+		pipeline.Medium = m_Medium;
+		pipeline.MediumBackground = true;
+		pipeline.Lighting = m_Lighting;
+		pipeline.SamplesShadowMap = m_ShadowsEnabled;
+		pipeline.DepthTest = pipeline.DepthWrite = false;
+		return DrawMesh(m_MediumBackground, pipeline);
 	}
 
 	bool Renderer::DrawMesh(const MeshResource& mesh, const PipelineState& pipeline)

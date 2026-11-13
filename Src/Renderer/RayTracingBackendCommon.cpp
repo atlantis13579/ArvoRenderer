@@ -1,6 +1,7 @@
 #include "Renderer/RayTracingBackendCommon.h"
 
 #include <algorithm>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <exception>
@@ -17,6 +18,39 @@ namespace RayTracing
 {
 namespace Detail
 {
+    bool ValidateMaterialTransport(const Scene& scene, BackendType backend,
+        Algorithm algorithm, std::string& error)
+    {
+        const auto inRange = [](float value, float minimum, float maximum)
+        { return std::isfinite(value) && value >= minimum && value <= maximum; };
+        const auto vectorInRange = [&](Float3 value, float minimum, float maximum)
+        { return inRange(value.X, minimum, maximum) && inRange(value.Y, minimum, maximum)
+            && inRange(value.Z, minimum, maximum); };
+        for (const Material& material : scene.Materials)
+        {
+            if (algorithm == Algorithm::PointBasedGlobalIllumination && !material.SampledEmitter &&
+                material.Model == MaterialModel::Legacy &&
+                (material.Reflectivity != 0 || material.SpecularColor.X != 0 || material.SpecularColor.Y != 0 || material.SpecularColor.Z != 0))
+            {
+                error = "Point GI requires diffuse scattering; select Diffuse for authored highlight/mirror materials.";
+                return false;
+            }
+            if (material.Model >= MaterialModel::Count)
+            {
+                error = "Unknown material scattering model.";
+                return false;
+            }
+            if (material.Model == MaterialModel::Legacy) continue;
+            if (!ValidateMaterialSupport(material, backend, algorithm, error)) return false;
+            if (!vectorInRange(material.Albedo, 0, 1))
+            {
+                error = "Physical materials require albedo in [0,1].";
+                return false;
+            }
+        }
+        return true;
+    }
+
     bool BuildRayTextureAtlas(
         const Scene& scene,
         PackedRayTextureAtlas& atlas,

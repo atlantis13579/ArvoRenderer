@@ -307,7 +307,7 @@ static const int SLIDER_HEIGHT = 20;
 static const int SLIDER_MARKER_WIDTH = 10;
 static const int CHECK_SIZE = 8;
 static const int DEFAULT_SPACING = 4;
-static const int TEXT_HEIGHT = 8;
+static const int TEXT_HEIGHT = IMGUI_TEXT_HEIGHT;
 static const int SCROLL_AREA_PADDING = 6;
 static const int INDENT_SIZE = 16;
 static const int AREA_HEADER = 28;
@@ -647,7 +647,9 @@ bool imguiSlider(const char* text, float* val, float vmin, float vmax, float vin
 
 	const int range = w - SLIDER_MARKER_WIDTH;
 
-	float u = (*val - vmin) / (vmax-vmin);
+	const bool adjustable = vmax > vmin && vinc > 0.0f && range > 0;
+	enabled = enabled && adjustable;
+	float u = adjustable ? (*val - vmin) / (vmax-vmin) : 0.0f;
 	if (u < 0) u = 0;
 	if (u > 1) u = 1;
 	int m = (int)(u * range);
@@ -656,7 +658,7 @@ bool imguiSlider(const char* text, float* val, float vmin, float vmax, float vin
 	bool res = buttonLogic(id, over);
 	bool valChanged = false;
 
-	if (isActive(id))
+	if (isActive(id) && enabled)
 	{
 		if (g_state.wentActive)
 		{
@@ -682,7 +684,8 @@ bool imguiSlider(const char* text, float* val, float vmin, float vmax, float vin
 
 	int digits = 0;
 	float scaledVinc = fabsf(vinc);
-	while (digits < 6 && fabsf(scaledVinc - floorf(scaledVinc + 0.5f)) > 0.0001f)
+	while (digits < 6 && scaledVinc > 0.0f
+		&& (scaledVinc < 0.5f || fabsf(scaledVinc - floorf(scaledVinc + 0.5f)) > 0.0001f))
 	{
 		scaledVinc *= 10.0f;
 		++digits;

@@ -1,0 +1,2 @@
+# The upstream OBJ references this library but contains no usemtl commands.
+# Arvo authors its three optical materials in Src/Editor/DragonDemo.cpp.

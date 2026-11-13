@@ -801,7 +801,8 @@ namespace Arvo::Editor
 		}
 
 		const float originX = x;
-		const float top = ToScreenY(y + static_cast<float>(m_FontHeight));
+		// Center actual glyphs in the layout box, snapping to whole pixels.
+		const float top = ToScreenY(y + (m_FontHeight + IMGUI_TEXT_HEIGHT) / 2);
 		std::vector<Vertex> vertices;
 		vertices.reserve(std::strlen(text) * 6);
 

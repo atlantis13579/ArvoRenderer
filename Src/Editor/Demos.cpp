@@ -139,6 +139,8 @@ struct Bounds
         return "Scenes/CornellBox/CornellBox-Original.obj";
     case DemoId::SponzaAtrium:
         return "Scenes/Sponza/sponza.obj";
+    case DemoId::StanfordDragon:
+        return "Scenes/Dragon/Dragon_80K.obj";
     }
     throw std::invalid_argument("Unknown scene");
 }
@@ -153,13 +155,34 @@ DemoCatalog::DemoCatalog(std::filesystem::path contentRoot)
 const std::vector<DemoDescriptor>& DemoCatalog::Descriptors()
 {
     static const std::vector<DemoDescriptor> descriptors = {
-        {DemoId::CornellBox, "Cornell Box", "A compact scene for shadows and light transport."},
-        {DemoId::SponzaAtrium, "Sponza Atrium", "A detailed architectural stress scene."}};
+        {DemoId::CornellBox, "cornell", "Cornell Box", "A compact scene for shadows and light transport."},
+        {DemoId::SponzaAtrium, "sponza", "Sponza Atrium", "A detailed architectural stress scene."},
+        {DemoId::StanfordDragon, "dragon", "Stanford Dragon",
+         "Clear glass, frosted refraction and subsurface scattering in a ceiling-lit Cornell room."}};
     return descriptors;
+}
+
+std::string_view DemoKey(DemoId demo)
+{
+    for (const auto& descriptor : DemoCatalog::Descriptors())
+        if (descriptor.Id == demo) return descriptor.Key;
+    throw std::invalid_argument("Unknown demo identifier");
+}
+
+bool ParseDemo(std::string_view key, DemoId& demo)
+{
+    for (const auto& descriptor : DemoCatalog::Descriptors())
+        if (descriptor.Key == key)
+        {
+            demo = descriptor.Id;
+            return true;
+        }
+    return false;
 }
 
 SceneSnapshot DemoCatalog::Load(DemoId demo) const
 {
+    if (demo == DemoId::StanfordDragon) return LoadDragonDemo(ModelPath(demo));
     return LoadModelDemo(demo, ModelPath(demo));
 }
 
@@ -203,6 +226,8 @@ SceneSnapshot DemoCatalog::LoadModelDemo(
 
     if (demo == DemoId::CornellBox)
     {
+        for (auto& material : scene.Materials)
+            material.SampledEmitter = material.Name == "light";
         scene.SceneCamera.Position = {0.0f, 0.0f, 4.2f};
         scene.SceneCamera.Target = {0.0f, 0.0f, 0.0f};
         scene.Lights.push_back(CornellEmitter(scene));

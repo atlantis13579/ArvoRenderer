@@ -1,8 +1,27 @@
+#include "Renderer/SubsurfaceValidation.h"
 #include "MetalRayTracingRHI.h"
+#include "Renderer/Reconstruction.h"
+#include "Renderer/AdaptiveReconstruction.h"
+#include "Renderer/ParticipatingMedia.h"
+#include "Renderer/SpectralSceneData.h"
+#include "Renderer/GeometryGuides.h"
+#include "Renderer/TemporalReconstruction.h"
+#include "Renderer/MicropolygonPreparation.h"
+#include <type_traits>
 
 #if defined(__APPLE__)
 
-#include "Renderer/RayTracingBackendCommon.h"
+#include "Backends/Metal/Limits.h"
+#include "Backends/Metal/ScenePacking.h"
+#include "Backends/Metal/BidirectionalLayout.h"
+#include "Backends/Metal/MetropolisLayout.h"
+#include "Backends/Metal/PhotonLayout.h"
+#include "Backends/Metal/ProgressivePhotonLayout.h"
+#include "Backends/Metal/PointGiGeometry.h"
+#include "Backends/Metal/VertexConnectionMergingFrame.h"
+#include "Maths/ColorSpace.h"
+#include "Renderer/EmitterData.h"
+#include "MetalShaderSources.h"
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -28,101 +47,23 @@ namespace RayTracing
 namespace
 {
 
-constexpr std::uint32_t SphereBit = 0x80000000u;
-constexpr std::uint32_t LeafPrimitiveCount = 8u;
-constexpr std::uint32_t MaximumBuildDepth = 48u;
+using namespace MetalScene;
+static_assert(MetalBdpt::MaximumReflections == MetalLimits::MaximumReflectionBounces,
+              "Metal BDPT path storage must cover the validated depth range.");
+constexpr NSUInteger InstanceRecordBinding = 13u, InstanceNodeBinding = 14u, InstanceErrorBinding = 15u;
+
 constexpr std::uint32_t ThreadsPerGroup = 256u;
 constexpr std::uint32_t PixelChunkSize = 16384u;
-constexpr std::uint32_t LightTypeDirectional = 0u;
-constexpr std::uint32_t LightTypePoint = 1u;
-constexpr std::uint32_t LightTypeRectArea = 2u;
 constexpr float Pi = 3.14159265358979323846f;
 
-struct Vec3
+struct QueryRay
 {
-    float X = 0.0f;
-    float Y = 0.0f;
-    float Z = 0.0f;
+    Vec4 OriginMinimum;
+    Vec4 DirectionMaximum;
 };
-
-struct alignas(16) Vec4
-{
-    float X = 0.0f;
-    float Y = 0.0f;
-    float Z = 0.0f;
-    float W = 0.0f;
-};
-
-struct alignas(16) PackedBvhNode
-{
-    float MinX = 0.0f;
-    float MinY = 0.0f;
-    float MinZ = 0.0f;
-    std::uint32_t FirstOrEscape = 0;
-    float MaxX = 0.0f;
-    float MaxY = 0.0f;
-    float MaxZ = 0.0f;
-    std::uint32_t PrimitiveCount = 0;
-};
-
-struct PackedPrimitiveRef
-{
-    std::uint32_t TypeAndIndex = 0;
-};
-
-struct alignas(16) PackedTriangle
-{
-    Vec4 Position0;
-    Vec4 Edge1;
-    Vec4 Edge2;
-    Vec4 Normal0;
-    Vec4 Normal1;
-    Vec4 Normal2;
-    Vec4 Color0;
-    Vec4 Color1;
-    Vec4 Color2;
-    Vec4 TexCoord01;
-    Vec4 TexCoord2;
-    std::uint32_t MaterialIndex = 0;
-    std::uint32_t Flags = 0;
-    std::uint32_t Padding0 = 0;
-    std::uint32_t Padding1 = 0;
-};
-
-struct alignas(16) PackedSphere
-{
-    Vec4 CenterRadius;
-    std::uint32_t MaterialIndex = 0;
-    std::uint32_t Padding0 = 0;
-    std::uint32_t Padding1 = 0;
-    std::uint32_t Padding2 = 0;
-};
-
-struct alignas(16) PackedMaterial
-{
-    Vec4 AlbedoReflectivity;
-    Vec4 AmbientShininess;
-    Vec4 Specular;
-    Vec4 Emission;
-    std::uint32_t DiffuseTextureIndex = InvalidRayTextureIndex;
-    std::uint32_t SampledEmitter = 0;
-    std::uint32_t Padding1 = 0;
-    std::uint32_t Padding2 = 0;
-};
-
-struct alignas(16) PackedLight
-{
-    Vec3 Position;
-    std::uint32_t Type = LightTypeDirectional;
-    Vec3 Direction;
-    float Intensity = 0.0f;
-    Vec3 Color;
-    std::uint32_t CastShadows = 0u;
-    float Width = 0.0f;
-    float Height = 0.0f;
-    std::uint32_t Padding0 = 0u;
-    std::uint32_t Padding1 = 0u;
-};
+static_assert(sizeof(QueryRay) == 32u && sizeof(RayQueryHit) == 64u
+    && offsetof(RayQueryHit, Flags) == 44u && offsetof(RayQueryHit, GeometricNormal) == 48u,
+    "Metal query buffer ABI mismatch.");
 
 struct alignas(16) FrameConstants
 {
@@ -159,9 +100,20 @@ struct alignas(16) FrameConstants
     std::uint32_t TileX = 0;
     std::uint32_t TileY = 0;
     std::uint32_t Integrator = 0;
-    std::uint32_t IntegratorPadding0 = 0;
-    std::uint32_t IntegratorPadding1 = 0;
-    std::uint32_t IntegratorPadding2 = 0;
+    std::uint32_t TransportFlags = 0;
+    std::uint32_t RouletteStartDepth = 0;
+    std::uint32_t SamplingSequence = 0;
+    std::uint32_t AdaptiveEnabled = 0;
+    std::uint32_t AdaptivePilotSamples = 0;
+    std::uint32_t AdaptiveMinimumSamples = 0;
+    std::uint32_t AdaptivePhase = 0;
+    float AdaptiveRelativeError = 0.0f;
+    float AdaptiveAbsoluteError = 0.0f;
+    std::uint32_t Acceleration = 0;
+    std::uint32_t InstanceNodeCount = 0;
+    float LensRadius = 0;
+    float FocusDistance = 0;
+    std::uint32_t SamplingSeed = 0, LensPadding1 = 0;
 };
 
 struct Counter64Parts
@@ -186,16 +138,19 @@ struct GroupStatistics
 
 static_assert(sizeof(Vec3) == 12u, "Metal packed float3 host ABI mismatch.");
 static_assert(sizeof(Vec4) == 16u, "Metal float4 host ABI mismatch.");
-static_assert(sizeof(PackedBvhNode) == 32u, "Metal BVH ABI mismatch.");
-static_assert(offsetof(PackedBvhNode, FirstOrEscape) == 12u, "Metal BVH field ABI mismatch.");
-static_assert(offsetof(PackedBvhNode, PrimitiveCount) == 28u, "Metal BVH field ABI mismatch.");
+static_assert(sizeof(PackedAccelerationNode) == 48u, "Metal acceleration node ABI mismatch.");
+static_assert(offsetof(PackedAccelerationNode, SplitPosition) == 32u
+    && offsetof(PackedAccelerationNode, AboveChild) == 40u, "Metal kd-tree field ABI mismatch.");
+static_assert(offsetof(PackedAccelerationNode, SecondPlane) == 44u, "Metal BIH field ABI mismatch.");
+static_assert(offsetof(PackedAccelerationNode, FirstOrEscape) == 12u, "Metal BVH field ABI mismatch.");
+static_assert(offsetof(PackedAccelerationNode, PrimitiveCount) == 28u, "Metal BVH field ABI mismatch.");
 static_assert(sizeof(PackedPrimitiveRef) == 4u, "Metal primitive reference ABI mismatch.");
 static_assert(sizeof(PackedTriangle) == 192u, "Metal triangle ABI mismatch.");
 static_assert(offsetof(PackedTriangle, TexCoord01) == 144u, "Metal triangle field ABI mismatch.");
 static_assert(offsetof(PackedTriangle, TexCoord2) == 160u, "Metal triangle field ABI mismatch.");
 static_assert(offsetof(PackedTriangle, MaterialIndex) == 176u, "Metal triangle field ABI mismatch.");
 static_assert(sizeof(PackedSphere) == 32u, "Metal sphere ABI mismatch.");
-static_assert(sizeof(PackedMaterial) == 80u, "Metal material ABI mismatch.");
+static_assert(sizeof(PackedMaterial) == 128u, "Metal material ABI mismatch.");
 static_assert(
     offsetof(PackedMaterial, AmbientShininess) == 16u
         && offsetof(PackedMaterial, Specular) == 32u
@@ -216,7 +171,7 @@ static_assert(offsetof(PackedLight, Width) == 48u, "Metal light width ABI mismat
 static_assert(offsetof(PackedLight, Height) == 52u, "Metal light height ABI mismatch.");
 static_assert(offsetof(PackedLight, Padding0) == 56u, "Metal light padding ABI mismatch.");
 static_assert(offsetof(PackedLight, Padding1) == 60u, "Metal light padding ABI mismatch.");
-static_assert(sizeof(FrameConstants) == 192u, "Metal frame constant ABI mismatch.");
+static_assert(sizeof(FrameConstants) == 240u, "Metal frame constant ABI mismatch.");
 static_assert(offsetof(FrameConstants, Width) == 12u, "Metal camera constant ABI mismatch.");
 static_assert(offsetof(FrameConstants, BackgroundBottom) == 96u, "Metal environment constant ABI mismatch.");
 static_assert(offsetof(FrameConstants, ShadowStrength) == 124u, "Metal shadow constant ABI mismatch.");
@@ -224,16 +179,16 @@ static_assert(offsetof(FrameConstants, PixelBegin) == 128u, "Metal dispatch cons
 static_assert(offsetof(FrameConstants, TextureCount) == 152u, "Metal texture constant ABI mismatch.");
 static_assert(offsetof(FrameConstants, FullWidth) == 160u, "Metal tile constant ABI mismatch.");
 static_assert(offsetof(FrameConstants, Integrator) == 176u, "Metal integrator constant ABI mismatch.");
+static_assert(offsetof(FrameConstants, AdaptiveEnabled) == 192u, "Metal adaptive constant ABI mismatch.");
+static_assert(offsetof(FrameConstants, Acceleration) == 216u, "Metal acceleration constant ABI mismatch.");
+static_assert(offsetof(FrameConstants, InstanceNodeCount) == 220u, "Metal instance constant ABI mismatch.");
+static_assert(offsetof(FrameConstants, LensRadius) == 224u && offsetof(FrameConstants, FocusDistance) == 228u,
+    "Metal lens constant ABI mismatch.");
 static_assert(sizeof(GroupStatistics) == 32u, "Metal statistics ABI mismatch.");
 
 [[nodiscard]] Vec3 ToVec3(const Float3& value)
 {
     return {value.X, value.Y, value.Z};
-}
-
-[[nodiscard]] Vec4 ToVec4(const Float3& value, float w = 0.0f)
-{
-    return {value.X, value.Y, value.Z, w};
 }
 
 [[nodiscard]] Vec3 Add(const Vec3& left, const Vec3& right)
@@ -294,83 +249,22 @@ static_assert(sizeof(GroupStatistics) == 32u, "Metal statistics ABI mismatch.");
     return std::isfinite(value.X) && std::isfinite(value.Y) && std::isfinite(value.Z);
 }
 
-struct Bounds
-{
-    Vec3 Minimum{
-        std::numeric_limits<float>::max(),
-        std::numeric_limits<float>::max(),
-        std::numeric_limits<float>::max()};
-    Vec3 Maximum{
-        -std::numeric_limits<float>::max(),
-        -std::numeric_limits<float>::max(),
-        -std::numeric_limits<float>::max()};
-
-    void Expand(const Vec3& point)
-    {
-        Minimum.X = std::min(Minimum.X, point.X);
-        Minimum.Y = std::min(Minimum.Y, point.Y);
-        Minimum.Z = std::min(Minimum.Z, point.Z);
-        Maximum.X = std::max(Maximum.X, point.X);
-        Maximum.Y = std::max(Maximum.Y, point.Y);
-        Maximum.Z = std::max(Maximum.Z, point.Z);
-    }
-
-    void Expand(const Bounds& bounds)
-    {
-        Expand(bounds.Minimum);
-        Expand(bounds.Maximum);
-    }
-
-    [[nodiscard]] Vec3 Center() const
-    {
-        return Multiply(Add(Minimum, Maximum), 0.5f);
-    }
-};
-
-[[nodiscard]] float Component(const Vec3& value, std::uint32_t axis)
-{
-    return axis == 0u ? value.X : (axis == 1u ? value.Y : value.Z);
-}
-
-struct BuildPrimitive
-{
-    Bounds BoundingBox;
-    Vec3 Centroid;
-    PackedPrimitiveRef Reference;
-};
-
-struct BuildNode
-{
-    Bounds BoundingBox;
-    std::uint32_t Left = 0;
-    std::uint32_t Right = 0;
-    std::uint32_t FirstPrimitive = 0;
-    std::uint32_t PrimitiveCount = 0;
-
-    [[nodiscard]] bool IsLeaf() const noexcept
-    {
-        return PrimitiveCount != 0u;
-    }
-};
-
-struct PackedScene
-{
-    std::vector<PackedBvhNode> Nodes;
-    std::vector<PackedPrimitiveRef> PrimitiveRefs;
-    std::vector<PackedTriangle> Triangles;
-    std::vector<PackedSphere> Spheres;
-    std::vector<PackedMaterial> Materials;
-    std::vector<PackedLight> Lights;
-    Detail::PackedRayTextureAtlas TextureAtlas;
-};
-
 [[nodiscard]] bool ValidateInput(
     const Scene& scene,
     const Camera& camera,
     const RenderSettings& settings,
-    std::string& error)
+    std::string& error, bool validateMotionSchedule = true)
 {
-    if (!ValidateTileSettings(settings, error)) return false;
+    if (!MetalInstances::Validate(scene, error)) return false;
+    if (!ValidateCameraLens(camera.Lens, error) ||
+                (validateMotionSchedule && !ValidateSubsurfaceScene(scene, settings, error)) ||
+        !ValidateCameraMotionSupport(settings.Integrator, camera.Motion, error) ||
+                (validateMotionSchedule && !ValidateSceneMotionSupport(settings.Integrator, scene, error)) ||
+        !ValidateCameraSamplePlan(camera, settings, error))
+        return false;
+    if (!ValidateTileSettings(settings, error))
+        return false;
+    if (!ValidateIntegrator(BackendType::Metal, settings.Integrator, error)) return false;
     if (settings.Width == 0u || settings.Height == 0u
         || settings.Width > 16384u || settings.Height > 16384u)
     {
@@ -378,7 +272,7 @@ struct PackedScene
         return false;
     }
     if (settings.SamplesPerPixel == 0u || settings.SamplesPerPixel > 4096u
-        || settings.MaxReflectionBounces > 32u)
+        || settings.MaxReflectionBounces > MetalLimits::MaximumReflectionBounces)
     {
         error = "Metal sample or reflection settings exceed their safety limits.";
         return false;
@@ -477,51 +371,9 @@ struct PackedScene
             return false;
         }
     }
-    for (const Triangle& triangle : scene.Triangles)
-    {
-        if (triangle.MaterialIndex >= scene.Materials.size()
-            || !IsFinite(triangle.Position0) || !IsFinite(triangle.Position1)
-            || !IsFinite(triangle.Position2) || !IsFinite(triangle.Normal0)
-            || !IsFinite(triangle.Normal1) || !IsFinite(triangle.Normal2)
-            || !IsFinite(triangle.Color0) || !IsFinite(triangle.Color1)
-            || !IsFinite(triangle.Color2) || !IsFinite(triangle.TexCoord0)
-            || !IsFinite(triangle.TexCoord1) || !IsFinite(triangle.TexCoord2))
-        {
-            error = "Metal triangle data is invalid.";
-            return false;
-        }
-        const Vec3 edge1 = Subtract(ToVec3(triangle.Position1), ToVec3(triangle.Position0));
-        const Vec3 edge2 = Subtract(ToVec3(triangle.Position2), ToVec3(triangle.Position0));
-        const Vec3 area = CrossVector(edge1, edge2);
-        const float edge1LengthSquared = DotVector(edge1, edge1);
-        const float edge2LengthSquared = DotVector(edge2, edge2);
-        const float areaSquared = DotVector(area, area);
-        if (!std::isfinite(edge1LengthSquared) || !std::isfinite(edge2LengthSquared)
-            || !std::isfinite(areaSquared) || areaSquared < 1.0e-16f)
-        {
-            error = "Metal does not accept degenerate or numerically unsafe triangles.";
-            return false;
-        }
-    }
-    for (const Sphere& sphere : scene.Spheres)
-    {
-        const float radiusSquared = sphere.Radius * sphere.Radius;
-        const Float3 minimum{
-            sphere.Center.X - sphere.Radius,
-            sphere.Center.Y - sphere.Radius,
-            sphere.Center.Z - sphere.Radius};
-        const Float3 maximum{
-            sphere.Center.X + sphere.Radius,
-            sphere.Center.Y + sphere.Radius,
-            sphere.Center.Z + sphere.Radius};
-        if (sphere.MaterialIndex >= scene.Materials.size() || !IsFinite(sphere.Center)
-            || !std::isfinite(sphere.Radius) || sphere.Radius <= 0.0f
-            || !std::isfinite(radiusSquared) || !IsFinite(minimum) || !IsFinite(maximum))
-        {
-            error = "Metal sphere data is invalid.";
-            return false;
-        }
-    }
+    if (!ValidateGeometry(scene, scene.Materials.size(), error)) return false;
+    for (const auto& geometry : scene.Geometries)
+        if (!ValidateGeometry(*geometry, scene.Materials.size(), error)) return false;
     for (const DirectionalLight& light : scene.DirectionalLights)
     {
         const Vec3 direction = ToVec3(light.DirectionToLight);
@@ -583,1227 +435,6 @@ struct PackedScene
     }
     return true;
 }
-
-class ScenePacker
-{
-public:
-    explicit ScenePacker(Detail::CancellationProbe cancellation)
-        : Cancellation_(std::move(cancellation))
-    {
-    }
-
-    bool Pack(const Scene& scene, PackedScene& output, std::string& error)
-    {
-        output = {};
-        if (!Detail::BuildRayTextureAtlas(scene, output.TextureAtlas, error))
-        {
-            return false;
-        }
-        output.Triangles.reserve(scene.Triangles.size());
-        output.Spheres.reserve(scene.Spheres.size());
-        output.Materials.reserve(scene.Materials.size());
-        output.Lights.reserve(
-            scene.DirectionalLights.size()
-            + scene.PointLights.size()
-            + scene.RectAreaLights.size());
-        Primitives_.reserve(scene.Triangles.size() + scene.Spheres.size());
-
-        for (std::uint32_t index = 0; index < scene.Triangles.size(); ++index)
-        {
-            if ((index & 4095u) == 0u && IsCancelled())
-            {
-                return Cancel(error);
-            }
-            const Triangle& source = scene.Triangles[index];
-            const Vec3 position0 = ToVec3(source.Position0);
-            const Vec3 edge1 = Subtract(ToVec3(source.Position1), position0);
-            const Vec3 edge2 = Subtract(ToVec3(source.Position2), position0);
-            PackedTriangle triangle;
-            triangle.Position0 = {position0.X, position0.Y, position0.Z, 0.0f};
-            triangle.Edge1 = {edge1.X, edge1.Y, edge1.Z, 0.0f};
-            triangle.Edge2 = {edge2.X, edge2.Y, edge2.Z, 0.0f};
-            triangle.Normal0 = ToVec4(source.Normal0);
-            triangle.Normal1 = ToVec4(source.Normal1);
-            triangle.Normal2 = ToVec4(source.Normal2);
-            triangle.Color0 = ToVec4(source.Color0, 1.0f);
-            triangle.Color1 = ToVec4(source.Color1, 1.0f);
-            triangle.Color2 = ToVec4(source.Color2, 1.0f);
-            triangle.TexCoord01 = {
-                source.TexCoord0.X,
-                source.TexCoord0.Y,
-                source.TexCoord1.X,
-                source.TexCoord1.Y};
-            triangle.TexCoord2 = {
-                source.TexCoord2.X,
-                source.TexCoord2.Y,
-                0.0f,
-                0.0f};
-            triangle.MaterialIndex = source.MaterialIndex;
-            triangle.Flags = source.SmoothNormals ? 1u : 0u;
-            output.Triangles.push_back(triangle);
-
-            BuildPrimitive primitive;
-            primitive.BoundingBox.Expand(position0);
-            primitive.BoundingBox.Expand(Add(position0, edge1));
-            primitive.BoundingBox.Expand(Add(position0, edge2));
-            primitive.Centroid = primitive.BoundingBox.Center();
-            primitive.Reference.TypeAndIndex = index;
-            Primitives_.push_back(primitive);
-        }
-        for (std::uint32_t index = 0; index < scene.Spheres.size(); ++index)
-        {
-            if ((index & 4095u) == 0u && IsCancelled())
-            {
-                return Cancel(error);
-            }
-            const Sphere& source = scene.Spheres[index];
-            PackedSphere sphere;
-            sphere.CenterRadius = ToVec4(source.Center, source.Radius);
-            sphere.MaterialIndex = source.MaterialIndex;
-            output.Spheres.push_back(sphere);
-
-            const Vec3 center = ToVec3(source.Center);
-            const Vec3 radius{source.Radius, source.Radius, source.Radius};
-            BuildPrimitive primitive;
-            primitive.BoundingBox.Expand(Subtract(center, radius));
-            primitive.BoundingBox.Expand(Add(center, radius));
-            primitive.Centroid = center;
-            primitive.Reference.TypeAndIndex = SphereBit | index;
-            Primitives_.push_back(primitive);
-        }
-        for (std::uint32_t index = 0; index < scene.Materials.size(); ++index)
-        {
-            if ((index & 4095u) == 0u && IsCancelled())
-            {
-                return Cancel(error);
-            }
-            const Material& source = scene.Materials[index];
-            PackedMaterial material;
-            material.AlbedoReflectivity = ToVec4(source.Albedo, source.Reflectivity);
-            material.AmbientShininess = ToVec4(source.AmbientColor, source.Shininess);
-            material.Specular = ToVec4(source.SpecularColor);
-            material.Emission = ToVec4(source.Emission);
-            material.DiffuseTextureIndex = source.DiffuseTextureIndex;
-            material.SampledEmitter = source.SampledEmitter ? 1u : 0u;
-            output.Materials.push_back(material);
-        }
-        for (std::uint32_t index = 0; index < scene.DirectionalLights.size(); ++index)
-        {
-            if ((index & 4095u) == 0u && IsCancelled())
-            {
-                return Cancel(error);
-            }
-            const DirectionalLight& source = scene.DirectionalLights[index];
-            const Vec3 direction = NormalizeVector(ToVec3(source.DirectionToLight));
-            PackedLight light;
-            light.Type = LightTypeDirectional;
-            light.Direction = direction;
-            light.Intensity = source.Intensity;
-            light.Color = ToVec3(source.Color);
-            light.CastShadows = source.CastShadows ? 1u : 0u;
-            output.Lights.push_back(light);
-        }
-        for (std::uint32_t index = 0; index < scene.PointLights.size(); ++index)
-        {
-            if ((index & 4095u) == 0u && IsCancelled())
-            {
-                return Cancel(error);
-            }
-            const PointLight& source = scene.PointLights[index];
-            PackedLight light;
-            light.Position = ToVec3(source.Position);
-            light.Type = LightTypePoint;
-            light.Intensity = source.Intensity;
-            light.Color = ToVec3(source.Color);
-            light.CastShadows = source.CastShadows ? 1u : 0u;
-            output.Lights.push_back(light);
-        }
-        for (std::uint32_t index = 0; index < scene.RectAreaLights.size(); ++index)
-        {
-            if ((index & 4095u) == 0u && IsCancelled())
-            {
-                return Cancel(error);
-            }
-            const RectAreaLight& source = scene.RectAreaLights[index];
-            PackedLight light;
-            light.Position = ToVec3(source.Position);
-            light.Type = LightTypeRectArea;
-            light.Direction = NormalizeVector(ToVec3(source.Direction));
-            light.Intensity = source.Intensity;
-            light.Color = ToVec3(source.Color);
-            light.CastShadows = source.CastShadows ? 1u : 0u;
-            light.Width = source.Size.X;
-            light.Height = source.Size.Y;
-            output.Lights.push_back(light);
-        }
-
-        if (!Primitives_.empty())
-        {
-            BuildNodes_.reserve(Primitives_.size() * 2u);
-            const std::uint32_t root = BuildRecursive(
-                0u,
-                static_cast<std::uint32_t>(Primitives_.size()),
-                0u);
-            if (IsCancelled())
-            {
-                return Cancel(error);
-            }
-            output.PrimitiveRefs.reserve(Primitives_.size());
-            for (const BuildPrimitive& primitive : Primitives_)
-            {
-                output.PrimitiveRefs.push_back(primitive.Reference);
-            }
-            output.Nodes.reserve(BuildNodes_.size());
-            Flatten(root, output.Nodes);
-        }
-        return true;
-    }
-
-private:
-    [[nodiscard]] bool IsCancelled() const
-    {
-        return Cancellation_ && Cancellation_();
-    }
-
-    bool Cancel(std::string& error) const
-    {
-        error = "Metal scene packing was cancelled.";
-        return false;
-    }
-
-    std::uint32_t BuildRecursive(
-        std::uint32_t begin,
-        std::uint32_t end,
-        std::uint32_t depth)
-    {
-        const std::uint32_t nodeIndex = static_cast<std::uint32_t>(BuildNodes_.size());
-        BuildNodes_.emplace_back();
-        Bounds primitiveBounds;
-        Bounds centroidBounds;
-        for (std::uint32_t index = begin; index < end; ++index)
-        {
-            primitiveBounds.Expand(Primitives_[index].BoundingBox);
-            centroidBounds.Expand(Primitives_[index].Centroid);
-        }
-        BuildNodes_[nodeIndex].BoundingBox = primitiveBounds;
-        const std::uint32_t count = end - begin;
-        const Vec3 centroidExtent = Subtract(centroidBounds.Maximum, centroidBounds.Minimum);
-        if (count <= LeafPrimitiveCount || depth >= MaximumBuildDepth || IsCancelled()
-            || std::max({centroidExtent.X, centroidExtent.Y, centroidExtent.Z}) <= 1.0e-6f)
-        {
-            BuildNodes_[nodeIndex].FirstPrimitive = begin;
-            BuildNodes_[nodeIndex].PrimitiveCount = count;
-            return nodeIndex;
-        }
-
-        std::uint32_t axis = centroidExtent.Y > centroidExtent.X ? 1u : 0u;
-        if (Component(centroidExtent, 2u) > Component(centroidExtent, axis))
-        {
-            axis = 2u;
-        }
-        const std::uint32_t middle = begin + count / 2u;
-        std::nth_element(
-            Primitives_.begin() + begin,
-            Primitives_.begin() + middle,
-            Primitives_.begin() + end,
-            [axis](const BuildPrimitive& left, const BuildPrimitive& right)
-            {
-                return Component(left.Centroid, axis) < Component(right.Centroid, axis);
-            });
-        const std::uint32_t left = BuildRecursive(begin, middle, depth + 1u);
-        const std::uint32_t right = BuildRecursive(middle, end, depth + 1u);
-        BuildNodes_[nodeIndex].Left = left;
-        BuildNodes_[nodeIndex].Right = right;
-        return nodeIndex;
-    }
-
-    void Flatten(std::uint32_t buildIndex, std::vector<PackedBvhNode>& output)
-    {
-        const std::uint32_t outputIndex = static_cast<std::uint32_t>(output.size());
-        output.emplace_back();
-        const BuildNode& source = BuildNodes_[buildIndex];
-        output[outputIndex].MinX = source.BoundingBox.Minimum.X;
-        output[outputIndex].MinY = source.BoundingBox.Minimum.Y;
-        output[outputIndex].MinZ = source.BoundingBox.Minimum.Z;
-        output[outputIndex].MaxX = source.BoundingBox.Maximum.X;
-        output[outputIndex].MaxY = source.BoundingBox.Maximum.Y;
-        output[outputIndex].MaxZ = source.BoundingBox.Maximum.Z;
-        if (source.IsLeaf())
-        {
-            output[outputIndex].FirstOrEscape = source.FirstPrimitive;
-            output[outputIndex].PrimitiveCount = source.PrimitiveCount;
-            return;
-        }
-        Flatten(source.Left, output);
-        Flatten(source.Right, output);
-        output[outputIndex].FirstOrEscape = static_cast<std::uint32_t>(output.size());
-    }
-
-    Detail::CancellationProbe Cancellation_;
-    std::vector<BuildPrimitive> Primitives_;
-    std::vector<BuildNode> BuildNodes_;
-};
-
-constexpr const char* MetalShaderSource = R"MSL(
-#include <metal_stdlib>
-using namespace metal;
-
-constant uint SphereBit = 0x80000000u;
-constant uint LightTypeDirectional = 0u;
-constant uint LightTypePoint = 1u;
-constant uint LightTypeRectArea = 2u;
-constant float RayEpsilon = 1.0e-4f;
-
-struct PackedBvhNode
-{
-    packed_float3 Minimum;
-    uint FirstOrEscape;
-    packed_float3 Maximum;
-    uint PrimitiveCount;
-};
-
-struct PackedTriangle
-{
-    float4 Position0;
-    float4 Edge1;
-    float4 Edge2;
-    float4 Normal0;
-    float4 Normal1;
-    float4 Normal2;
-    float4 Color0;
-    float4 Color1;
-    float4 Color2;
-    float4 TexCoord01;
-    float4 TexCoord2;
-    uint MaterialIndex;
-    uint Flags;
-    uint Padding0;
-    uint Padding1;
-};
-
-struct PackedSphere
-{
-    float4 CenterRadius;
-    uint MaterialIndex;
-    uint Padding0;
-    uint Padding1;
-    uint Padding2;
-};
-
-struct PackedMaterial
-{
-    float4 AlbedoReflectivity;
-    float4 AmbientShininess;
-    float4 Specular;
-    float4 Emission;
-    uint DiffuseTextureIndex;
-    uint SampledEmitter;
-    uint Padding1;
-    uint Padding2;
-};
-
-struct PackedTextureDescriptor
-{
-    uint OffsetTexels;
-    uint Width;
-    uint Height;
-    uint Padding;
-};
-
-struct PackedLight
-{
-    packed_float3 Position;
-    uint Type;
-    packed_float3 Direction;
-    float Intensity;
-    packed_float3 Color;
-    uint CastShadows;
-    float Width;
-    float Height;
-    uint Padding0;
-    uint Padding1;
-};
-
-struct FrameConstants
-{
-    packed_float3 CameraPosition;
-    uint Width;
-    packed_float3 CameraForward;
-    uint Height;
-    packed_float3 CameraRight;
-    uint TotalSamples;
-    packed_float3 CameraUp;
-    uint MaxReflectionBounces;
-    float HalfWidth;
-    float HalfHeight;
-    uint MaterialCount;
-    uint LightCount;
-    packed_float3 BackgroundTop;
-    float AmbientIntensity;
-    packed_float3 BackgroundBottom;
-    uint NodeCount;
-    uint PrimitiveRefCount;
-    uint TriangleCount;
-    uint SphereCount;
-    float ShadowStrength;
-    uint PixelBegin;
-    uint PixelCount;
-    uint SampleBegin;
-    uint SampleCount;
-    uint GammaCorrection;
-    uint GroupCount;
-    uint TextureCount;
-    uint TextureTexelCount;
-    uint FullWidth;
-    uint FullHeight;
-    uint TileX;
-    uint TileY;
-    uint Integrator;
-    uint IntegratorPadding0;
-    uint IntegratorPadding1;
-    uint IntegratorPadding2;
-};
-
-struct Counter64Parts
-{
-    uint Low;
-    uint High;
-};
-
-struct GroupStatistics
-{
-    Counter64Parts PrimaryRays;
-    Counter64Parts ShadowRays;
-    Counter64Parts ReflectionRays;
-    Counter64Parts PrimitiveTests;
-};
-
-struct RayData
-{
-    float3 Origin;
-    float3 Direction;
-    float MinimumDistance;
-    float MaximumDistance;
-};
-
-struct HitData
-{
-    float Distance;
-    float3 Normal;
-    float3 Color;
-    uint MaterialIndex;
-    float2 TexCoord;
-    uint HasTexCoord;
-};
-
-uint Hash(uint value)
-{
-    value ^= value >> 16u;
-    value *= 0x7feb352du;
-    value ^= value >> 15u;
-    value *= 0x846ca68bu;
-    value ^= value >> 16u;
-    return value;
-}
-
-float Random01(uint seed)
-{
-    return float(Hash(seed) & 0x00ffffffu) / 16777216.0f;
-}
-
-float SRGBToLinear(float value)
-{
-    return value <= 0.04045f
-        ? value / 12.92f
-        : pow((value + 0.055f) / 1.055f, 2.4f);
-}
-
-int WrapTextureCoordinate(int value, uint size)
-{
-    const int signedSize = int(size);
-    const int wrapped = value % signedSize;
-    return wrapped < 0 ? wrapped + signedSize : wrapped;
-}
-
-float3 LoadDiffuseTexel(
-    device const uint* textureTexels,
-    PackedTextureDescriptor descriptor,
-    int x,
-    int y)
-{
-    const uint offset = descriptor.OffsetTexels
-        + uint(WrapTextureCoordinate(y, descriptor.Height)) * descriptor.Width
-        + uint(WrapTextureCoordinate(x, descriptor.Width));
-    const uint packed = textureTexels[offset];
-    return float3(
-        SRGBToLinear(float(packed & 0xffu) / 255.0f),
-        SRGBToLinear(float((packed >> 8u) & 0xffu) / 255.0f),
-        SRGBToLinear(float((packed >> 16u) & 0xffu) / 255.0f));
-}
-
-float3 SampleDiffuse(
-    device const PackedTextureDescriptor* textures,
-    device const uint* textureTexels,
-    constant FrameConstants& constants,
-    uint textureIndex,
-    float2 texCoord,
-    uint hasTexCoord)
-{
-    if (hasTexCoord == 0u || textureIndex >= constants.TextureCount)
-    {
-        return float3(1.0f);
-    }
-    const PackedTextureDescriptor descriptor = textures[textureIndex];
-    if (descriptor.Width == 0u || descriptor.Height == 0u
-        || descriptor.OffsetTexels >= constants.TextureTexelCount)
-    {
-        return float3(1.0f);
-    }
-    const uint availableTexels =
-        constants.TextureTexelCount - descriptor.OffsetTexels;
-    if (descriptor.Height > availableTexels / descriptor.Width)
-    {
-        return float3(1.0f);
-    }
-
-    const float x = fract(texCoord.x) * float(descriptor.Width) - 0.5f;
-    const float y = fract(1.0f - texCoord.y) * float(descriptor.Height) - 0.5f;
-    const float floorX = floor(x);
-    const float floorY = floor(y);
-    const int x0 = int(floorX);
-    const int y0 = int(floorY);
-    const float amountX = x - floorX;
-    const float amountY = y - floorY;
-    const float3 top = mix(
-        LoadDiffuseTexel(textureTexels, descriptor, x0, y0),
-        LoadDiffuseTexel(textureTexels, descriptor, x0 + 1, y0),
-        amountX);
-    const float3 bottom = mix(
-        LoadDiffuseTexel(textureTexels, descriptor, x0, y0 + 1),
-        LoadDiffuseTexel(textureTexels, descriptor, x0 + 1, y0 + 1),
-        amountX);
-    return mix(top, bottom, amountY);
-}
-
-void IncrementCounter(thread uint2& counter)
-{
-    const uint previousLow = counter.x;
-    counter.x += 1u;
-    if (counter.x < previousLow)
-    {
-        counter.y += 1u;
-    }
-}
-
-uint2 AddCounter(uint2 left, uint2 right)
-{
-    const uint low = left.x + right.x;
-    return uint2(low, left.y + right.y + (low < left.x ? 1u : 0u));
-}
-
-bool IntersectBounds(PackedBvhNode node, RayData ray, float closestDistance)
-{
-    const float3 minimum = float3(node.Minimum);
-    const float3 maximum = float3(node.Maximum);
-    float nearDistance = ray.MinimumDistance;
-    float farDistance = min(ray.MaximumDistance, closestDistance);
-    for (uint axis = 0u; axis < 3u; ++axis)
-    {
-        const float origin = ray.Origin[axis];
-        const float direction = ray.Direction[axis];
-        if (fabs(direction) < 1.0e-12f)
-        {
-            if (origin < minimum[axis] || origin > maximum[axis])
-            {
-                return false;
-            }
-            continue;
-        }
-        const float inverseDirection = 1.0f / direction;
-        float distance0 = (minimum[axis] - origin) * inverseDirection;
-        float distance1 = (maximum[axis] - origin) * inverseDirection;
-        if (distance0 > distance1)
-        {
-            const float temporary = distance0;
-            distance0 = distance1;
-            distance1 = temporary;
-        }
-        nearDistance = max(nearDistance, distance0);
-        farDistance = min(farDistance, distance1);
-        if (nearDistance > farDistance)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool IntersectTriangle(
-    PackedTriangle primitive,
-    RayData ray,
-    thread HitData& hit)
-{
-    const float3 position0 = primitive.Position0.xyz;
-    const float3 edge1 = primitive.Edge1.xyz;
-    const float3 edge2 = primitive.Edge2.xyz;
-    const float3 determinantVector = cross(ray.Direction, edge2);
-    const float determinant = dot(edge1, determinantVector);
-    if (fabs(determinant) < 1.0e-8f)
-    {
-        return false;
-    }
-    const float inverseDeterminant = 1.0f / determinant;
-    const float3 originOffset = ray.Origin - position0;
-    const float barycentric1 = dot(originOffset, determinantVector) * inverseDeterminant;
-    if (barycentric1 < 0.0f || barycentric1 > 1.0f)
-    {
-        return false;
-    }
-    const float3 crossValue = cross(originOffset, edge1);
-    const float barycentric2 = dot(ray.Direction, crossValue) * inverseDeterminant;
-    if (barycentric2 < 0.0f || barycentric1 + barycentric2 > 1.0f)
-    {
-        return false;
-    }
-    const float distance = dot(edge2, crossValue) * inverseDeterminant;
-    if (distance < ray.MinimumDistance || distance > ray.MaximumDistance
-        || distance >= hit.Distance)
-    {
-        return false;
-    }
-
-    const float barycentric0 = 1.0f - barycentric1 - barycentric2;
-    float3 normal = normalize(cross(edge1, edge2));
-    if ((primitive.Flags & 1u) != 0u)
-    {
-        const float3 smoothNormal = primitive.Normal0.xyz * barycentric0
-            + primitive.Normal1.xyz * barycentric1
-            + primitive.Normal2.xyz * barycentric2;
-        if (dot(smoothNormal, smoothNormal) > 1.0e-12f)
-        {
-            normal = normalize(smoothNormal);
-        }
-    }
-    if (dot(normal, ray.Direction) > 0.0f)
-    {
-        normal = -normal;
-    }
-    hit.Distance = distance;
-    hit.Normal = normal;
-    hit.Color = primitive.Color0.xyz * barycentric0
-        + primitive.Color1.xyz * barycentric1
-        + primitive.Color2.xyz * barycentric2;
-    hit.MaterialIndex = primitive.MaterialIndex;
-    hit.TexCoord = primitive.TexCoord01.xy * barycentric0
-        + primitive.TexCoord01.zw * barycentric1
-        + primitive.TexCoord2.xy * barycentric2;
-    hit.HasTexCoord = 1u;
-    return true;
-}
-
-bool IntersectSphere(
-    PackedSphere sphere,
-    RayData ray,
-    thread HitData& hit)
-{
-    const float3 offset = ray.Origin - sphere.CenterRadius.xyz;
-    const float halfB = dot(offset, ray.Direction);
-    const float c = dot(offset, offset)
-        - sphere.CenterRadius.w * sphere.CenterRadius.w;
-    const float discriminant = halfB * halfB - c;
-    if (discriminant < 0.0f)
-    {
-        return false;
-    }
-    const float root = sqrt(discriminant);
-    float distance = -halfB - root;
-    if (distance < ray.MinimumDistance)
-    {
-        distance = -halfB + root;
-    }
-    if (distance < ray.MinimumDistance || distance > ray.MaximumDistance
-        || distance >= hit.Distance)
-    {
-        return false;
-    }
-    const float3 position = ray.Origin + ray.Direction * distance;
-    float3 normal = normalize(position - sphere.CenterRadius.xyz);
-    if (dot(normal, ray.Direction) > 0.0f)
-    {
-        normal = -normal;
-    }
-    hit.Distance = distance;
-    hit.Normal = normal;
-    hit.Color = float3(1.0f);
-    hit.MaterialIndex = sphere.MaterialIndex;
-    hit.TexCoord = float2(0.0f);
-    hit.HasTexCoord = 0u;
-    return true;
-}
-
-bool IntersectScene(
-    device const PackedBvhNode* nodes,
-    device const uint* primitiveRefs,
-    device const PackedTriangle* triangles,
-    device const PackedSphere* spheres,
-    constant FrameConstants& constants,
-    RayData ray,
-    bool anyHit,
-    thread HitData& hit,
-    thread uint2& primitiveTests)
-{
-    if (constants.NodeCount == 0u)
-    {
-        return false;
-    }
-    bool found = false;
-    uint nodeIndex = 0u;
-    while (nodeIndex < constants.NodeCount)
-    {
-        const PackedBvhNode node = nodes[nodeIndex];
-        if (!IntersectBounds(node, ray, hit.Distance))
-        {
-            nodeIndex = node.PrimitiveCount == 0u
-                ? node.FirstOrEscape
-                : nodeIndex + 1u;
-            continue;
-        }
-        if (node.PrimitiveCount == 0u)
-        {
-            ++nodeIndex;
-            continue;
-        }
-        for (uint offset = 0u; offset < node.PrimitiveCount; ++offset)
-        {
-            const uint encoded = primitiveRefs[node.FirstOrEscape + offset];
-            IncrementCounter(primitiveTests);
-            bool primitiveHit = false;
-            if ((encoded & SphereBit) != 0u)
-            {
-                primitiveHit = IntersectSphere(
-                    spheres[encoded & ~SphereBit],
-                    ray,
-                    hit);
-            }
-            else
-            {
-                primitiveHit = IntersectTriangle(
-                    triangles[encoded],
-                    ray,
-                    hit);
-            }
-            if (primitiveHit)
-            {
-                found = true;
-                if (anyHit)
-                {
-                    return true;
-                }
-            }
-        }
-        ++nodeIndex;
-    }
-    return found;
-}
-
-bool IsLightVisible(
-    device const PackedBvhNode* nodes,
-    device const uint* primitiveRefs,
-    device const PackedTriangle* triangles,
-    device const PackedSphere* spheres,
-    constant FrameConstants& constants,
-    float3 origin,
-    float3 direction,
-    float maximumDistance,
-    thread uint2& primitiveTests)
-{
-    RayData shadowRay;
-    shadowRay.Origin = origin;
-    shadowRay.Direction = direction;
-    shadowRay.MinimumDistance = RayEpsilon;
-    shadowRay.MaximumDistance = maximumDistance;
-    HitData shadowHit;
-    shadowHit.Distance = maximumDistance;
-    shadowHit.Normal = float3(0.0f);
-    shadowHit.Color = float3(1.0f);
-    shadowHit.MaterialIndex = 0u;
-    shadowHit.TexCoord = float2(0.0f);
-    shadowHit.HasTexCoord = 0u;
-    return !IntersectScene(
-        nodes,
-        primitiveRefs,
-        triangles,
-        spheres,
-        constants,
-        shadowRay,
-        true,
-        shadowHit,
-        primitiveTests);
-}
-
-float3 Background(constant FrameConstants& constants, float3 direction)
-{
-    const float blend = clamp(direction.y * 0.5f + 0.5f, 0.0f, 1.0f);
-    return mix(
-        float3(constants.BackgroundBottom),
-        float3(constants.BackgroundTop),
-        blend);
-}
-
-float3 NormalizeSafe(float3 value, float3 fallback)
-{
-    const float lengthSquared = dot(value, value);
-    return lengthSquared > 1.0e-12f
-        ? value * rsqrt(lengthSquared)
-        : fallback;
-}
-
-void AccumulateLightSample(
-    float3 lightDirection,
-    float3 incidentRadiance,
-    float visibility,
-    float3 surfaceNormal,
-    float3 viewDirection,
-    float shininess,
-    thread float3& diffuseLight,
-    thread float3& specularLight)
-{
-    const float directionLengthSquared = dot(lightDirection, lightDirection);
-    if (directionLengthSquared <= 1.0e-12f)
-    {
-        return;
-    }
-    const float3 direction = lightDirection * rsqrt(directionLengthSquared);
-    const float normalToLight = max(dot(surfaceNormal, direction), 0.0f);
-    if (normalToLight <= 0.0f)
-    {
-        return;
-    }
-    const float3 visibleRadiance = incidentRadiance * visibility;
-    diffuseLight += visibleRadiance * normalToLight;
-    const float3 halfVector = NormalizeSafe(
-        direction + viewDirection,
-        surfaceNormal);
-    const float specularAmount = pow(
-        max(dot(surfaceNormal, halfVector), 0.0f),
-        max(shininess, 1.0f));
-    specularLight += visibleRadiance * specularAmount;
-}
-
-float3 LinearToSRGB(float3 color)
-{
-    color = clamp(color, float3(0.0f), float3(1.0f));
-    const float3 low = color * 12.92f;
-    const float3 high = 1.055f * pow(color, float3(1.0f / 2.4f)) - 0.055f;
-    return select(high, low, color <= float3(0.0031308f));
-}
-
-kernel void ArvoTracePixels(
-    device const PackedBvhNode* nodes [[buffer(0)]],
-    device const uint* primitiveRefs [[buffer(1)]],
-    device const PackedTriangle* triangles [[buffer(2)]],
-    device const PackedSphere* spheres [[buffer(3)]],
-    device const PackedMaterial* materials [[buffer(4)]],
-    device const PackedLight* lights [[buffer(5)]],
-    constant FrameConstants& constants [[buffer(6)]],
-    device float4* accumulation [[buffer(7)]],
-    device uint* sampleCounts [[buffer(8)]],
-    device GroupStatistics* groupStatistics [[buffer(9)]],
-    device const PackedTextureDescriptor* textures [[buffer(10)]],
-    device const uint* textureTexels [[buffer(11)]],
-    uint gridIndex [[thread_position_in_grid]],
-    uint localIndex [[thread_index_in_threadgroup]],
-    uint3 groupPosition [[threadgroup_position_in_grid]])
-{
-    uint2 primaryRays = uint2(0u);
-    uint2 shadowRays = uint2(0u);
-    uint2 reflectionRays = uint2(0u);
-    uint2 primitiveTests = uint2(0u);
-    if (gridIndex < constants.PixelCount)
-    {
-        const uint pixelIndex = constants.PixelBegin + gridIndex;
-        const uint x = pixelIndex % constants.Width;
-        const uint y = pixelIndex / constants.Width;
-        float3 accumulated = float3(0.0f);
-        for (uint sampleOffset = 0u;
-             sampleOffset < constants.SampleCount;
-             ++sampleOffset)
-        {
-            const uint sample = constants.SampleBegin + sampleOffset;
-            IncrementCounter(primaryRays);
-            const uint pathSeed = ((y + constants.TileY) * constants.FullWidth + x + constants.TileX) * 9781u + sample * 6271u;
-            float jitterX = 0.5f;
-            float jitterY = 0.5f;
-            if (constants.TotalSamples > 1u)
-            {
-                const uint seed = pathSeed;
-                jitterX = Random01(seed);
-                jitterY = Random01(seed ^ 0x68bc21ebu);
-            }
-            const float u = (float(x + constants.TileX) + jitterX) / float(constants.FullWidth);
-            const float v = (float(y + constants.TileY) + jitterY) / float(constants.FullHeight);
-            const float screenX = (2.0f * u - 1.0f) * constants.HalfWidth;
-            const float screenY = (1.0f - 2.0f * v) * constants.HalfHeight;
-            RayData ray;
-            ray.Origin = float3(constants.CameraPosition);
-            ray.Direction = normalize(
-                float3(constants.CameraForward)
-                + float3(constants.CameraRight) * screenX
-                + float3(constants.CameraUp) * screenY);
-            ray.MinimumDistance = RayEpsilon;
-            ray.MaximumDistance = 1.0e30f;
-            float3 radiance = float3(0.0f);
-            float3 throughput = float3(1.0f);
-            bool previousDelta = true;
-            for (uint bounce = 0u;
-                 bounce <= constants.MaxReflectionBounces;
-                 ++bounce)
-            {
-                HitData hit;
-                hit.Distance = ray.MaximumDistance;
-                hit.Normal = float3(0.0f);
-                hit.Color = float3(1.0f);
-                hit.MaterialIndex = 0u;
-                hit.TexCoord = float2(0.0f);
-                hit.HasTexCoord = 0u;
-                if (!IntersectScene(
-                        nodes,
-                        primitiveRefs,
-                        triangles,
-                        spheres,
-                        constants,
-                        ray,
-                        false,
-                        hit,
-                        primitiveTests))
-                {
-                    radiance += throughput * Background(constants, ray.Direction);
-                    break;
-                }
-                const PackedMaterial material = materials[
-                    min(hit.MaterialIndex, constants.MaterialCount - 1u)];
-                const float3 surface = max(hit.Color, float3(0.0f))
-                    * max(
-                        SampleDiffuse(
-                            textures,
-                            textureTexels,
-                            constants,
-                            material.DiffuseTextureIndex,
-                            hit.TexCoord,
-                            hit.HasTexCoord),
-                        float3(0.0f));
-                const float3 position = ray.Origin + ray.Direction * hit.Distance;
-                const float3 viewDirection = NormalizeSafe(-ray.Direction, hit.Normal);
-                float3 diffuseLight = float3(0.0f);
-                float3 specularLight = float3(0.0f);
-                for (uint lightIndex = 0u;
-                     lightIndex < constants.LightCount;
-                     ++lightIndex)
-                {
-                    const PackedLight light = lights[lightIndex];
-                    if (light.Intensity <= 0.0f)
-                    {
-                        continue;
-                    }
-                    const float3 lightColor = float3(light.Color);
-                    if (light.Type == LightTypeDirectional)
-                    {
-                        const float3 directionToLight =
-                            normalize(float3(light.Direction));
-                        const float cosine =
-                            max(0.0f, dot(hit.Normal, directionToLight));
-                        if (cosine <= 0.0f)
-                        {
-                            continue;
-                        }
-                        float visibility = 1.0f;
-                        if (constants.ShadowStrength > 0.0f
-                            && light.CastShadows != 0u)
-                        {
-                            IncrementCounter(shadowRays);
-                            const float3 shadowNormal =
-                                dot(hit.Normal, directionToLight) >= 0.0f
-                                    ? hit.Normal
-                                    : -hit.Normal;
-                            const bool visible = IsLightVisible(
-                                nodes,
-                                primitiveRefs,
-                                triangles,
-                                spheres,
-                                constants,
-                                position + shadowNormal * RayEpsilon,
-                                directionToLight,
-                                1.0e30f,
-                                primitiveTests);
-                            if (!visible)
-                            {
-                                visibility = 1.0f - constants.ShadowStrength;
-                            }
-                        }
-                        AccumulateLightSample(
-                            directionToLight,
-                            max(lightColor, float3(0.0f))
-                                * max(light.Intensity, 0.0f),
-                            visibility,
-                            hit.Normal,
-                            viewDirection,
-                            material.AmbientShininess.w,
-                            diffuseLight,
-                            specularLight);
-                        continue;
-                    }
-                    if (light.Type != LightTypePoint
-                        && light.Type != LightTypeRectArea)
-                    {
-                        continue;
-                    }
-
-                    const bool isArea = light.Type == LightTypeRectArea;
-                    float3 emissionDirection = float3(0.0f);
-                    float3 tangent = float3(0.0f);
-                    float3 bitangent = float3(0.0f);
-                    uint finiteSampleCount = 1u;
-                    if (isArea)
-                    {
-                        emissionDirection = normalize(float3(light.Direction));
-                        const float3 helper = fabs(emissionDirection.y) < 0.999f
-                            ? float3(0.0f, 1.0f, 0.0f)
-                            : float3(1.0f, 0.0f, 0.0f);
-                        tangent = normalize(cross(helper, emissionDirection));
-                        bitangent =
-                            normalize(cross(emissionDirection, tangent));
-                        finiteSampleCount = 4u;
-                    }
-                    for (uint finiteSample = 0u;
-                         finiteSample < finiteSampleCount;
-                         ++finiteSample)
-                    {
-                        float3 samplePosition = float3(light.Position);
-                        float sampleWeight = 1.0f;
-                        if (isArea)
-                        {
-                            float offsetX = (finiteSample & 1u) != 0u ? 0.25f : -0.25f;
-                            float offsetY = (finiteSample & 2u) != 0u ? 0.25f : -0.25f;
-                            if (constants.Integrator != 0u)
-                            {
-                                const uint lightSeed = pathSeed ^ ((bounce + 1u) * 0x9e3779b9u)
-                                    ^ ((lightIndex + 1u) * 0x85ebca6bu) ^ ((finiteSample + 1u) * 0xc2b2ae35u);
-                                offsetX = (float(finiteSample & 1u) + Random01(lightSeed)) * 0.5f - 0.5f;
-                                offsetY = (float(finiteSample >> 1u) + Random01(lightSeed ^ 0x68bc21ebu)) * 0.5f - 0.5f;
-                            }
-                            samplePosition += tangent * (offsetX * light.Width)
-                                + bitangent * (offsetY * light.Height);
-                            sampleWeight = 0.25f;
-                        }
-                        const float3 toLight = samplePosition - position;
-                        const float distanceSquared = dot(toLight, toLight);
-                        if (!isfinite(distanceSquared)
-                            || distanceSquared <= RayEpsilon * RayEpsilon)
-                        {
-                            continue;
-                        }
-                        const float distance = sqrt(distanceSquared);
-                        const float3 directionToLight = toLight / distance;
-                        const float surfaceCosine =
-                            max(0.0f, dot(hit.Normal, directionToLight));
-                        if (surfaceCosine <= 0.0f)
-                        {
-                            continue;
-                        }
-                        float emitterCosine = 1.0f;
-                        if (isArea)
-                        {
-                            emitterCosine = max(
-                                0.0f,
-                                dot(emissionDirection, -directionToLight));
-                            if (emitterCosine <= 0.0f)
-                            {
-                                continue;
-                            }
-                        }
-
-                        float visibility = 1.0f;
-                        const float shadowMaximumDistance =
-                            distance - RayEpsilon;
-                        if (constants.ShadowStrength > 0.0f
-                            && light.CastShadows != 0u
-                            && shadowMaximumDistance > RayEpsilon)
-                        {
-                            IncrementCounter(shadowRays);
-                            const bool visible = IsLightVisible(
-                                nodes,
-                                primitiveRefs,
-                                triangles,
-                                spheres,
-                                constants,
-                                position + hit.Normal * RayEpsilon,
-                                directionToLight,
-                                shadowMaximumDistance,
-                                primitiveTests);
-                            if (!visible)
-                            {
-                                visibility = 1.0f - constants.ShadowStrength;
-                            }
-                        }
-                        const float3 incidentRadiance =
-                            max(lightColor, float3(0.0f))
-                            * (max(light.Intensity, 0.0f)
-                                * emitterCosine
-                                * sampleWeight
-                                / distanceSquared);
-                        AccumulateLightSample(
-                            directionToLight,
-                            incidentRadiance,
-                            visibility,
-                            hit.Normal,
-                            viewDirection,
-                            material.AmbientShininess.w,
-                            diffuseLight,
-                            specularLight);
-                    }
-                }
-                float3 direct = constants.Integrator != 0u
-                    ? max(material.Emission.xyz, float3(0.0f))
-                        + surface * max(material.AlbedoReflectivity.xyz, float3(0.0f)) * diffuseLight * 0.31830988618f
-                    : surface
-                        * max(material.AmbientShininess.xyz, float3(0.0f))
-                        * max(constants.AmbientIntensity, 0.0f)
-                    + surface
-                        * max(material.AlbedoReflectivity.xyz, float3(0.0f))
-                        * diffuseLight
-                    + max(material.Specular.xyz, float3(0.0f)) * specularLight
-                    + max(material.Emission.xyz, float3(0.0f));
-                const float reflectivity =
-                    clamp(material.AlbedoReflectivity.w, 0.0f, 1.0f);
-                if (constants.Integrator != 0u)
-                {
-                    radiance += throughput * ((previousDelta || material.SampledEmitter == 0u
-                        ? material.Emission.xyz : float3(0.0f, 0.0f, 0.0f))
-                        + (direct - material.Emission.xyz) * (1.0f - reflectivity));
-                    if (bounce == constants.MaxReflectionBounces) break;
-                    const uint seed = pathSeed ^ ((bounce + 1u) * 0x9e3779b9u);
-                    float3 outgoing;
-                    previousDelta = Random01(seed ^ 0xa511e9b3u) < reflectivity;
-                    if (previousDelta)
-                    {
-                        outgoing = normalize(reflect(ray.Direction, hit.Normal));
-                    }
-                    else
-                    {
-                        const float radius = sqrt(Random01(seed));
-                        const float phi = 6.28318530718f * Random01(seed ^ 0x68bc21ebu);
-                        const float3 helper = abs(hit.Normal.y) < 0.999f
-                            ? float3(0.0f, 1.0f, 0.0f) : float3(1.0f, 0.0f, 0.0f);
-                        const float3 tangent = normalize(cross(helper, hit.Normal));
-                        const float3 bitangent = cross(hit.Normal, tangent);
-                        outgoing = normalize(tangent * (radius * cos(phi))
-                            + bitangent * (radius * sin(phi))
-                            + hit.Normal * sqrt(max(0.0f, 1.0f - radius * radius)));
-                        throughput *= clamp(surface * material.AlbedoReflectivity.xyz, 0.0f, 1.0f);
-                    }
-                    ray.Origin = position + hit.Normal * RayEpsilon;
-                    ray.Direction = outgoing;
-                    IncrementCounter(reflectionRays);
-                    continue;
-                }
-                radiance += throughput * direct * (1.0f - reflectivity);
-                if (reflectivity <= 0.0f
-                    || bounce == constants.MaxReflectionBounces)
-                {
-                    break;
-                }
-                throughput *= reflectivity;
-                const float3 reflectedDirection =
-                    normalize(reflect(ray.Direction, hit.Normal));
-                const float3 reflectionNormal =
-                    dot(hit.Normal, reflectedDirection) >= 0.0f
-                        ? hit.Normal
-                        : -hit.Normal;
-                ray.Origin = position + reflectionNormal * RayEpsilon;
-                ray.Direction = reflectedDirection;
-                IncrementCounter(reflectionRays);
-            }
-            accumulated += radiance;
-        }
-        float4 current = accumulation[pixelIndex];
-        current.xyz += accumulated;
-        accumulation[pixelIndex] = current;
-        sampleCounts[pixelIndex] += constants.SampleCount;
-    }
-
-    threadgroup uint2 primaryShared[256];
-    threadgroup uint2 shadowShared[256];
-    threadgroup uint2 reflectionShared[256];
-    threadgroup uint2 primitiveShared[256];
-    primaryShared[localIndex] = primaryRays;
-    shadowShared[localIndex] = shadowRays;
-    reflectionShared[localIndex] = reflectionRays;
-    primitiveShared[localIndex] = primitiveTests;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride != 0u; stride >>= 1u)
-    {
-        if (localIndex < stride)
-        {
-            primaryShared[localIndex] = AddCounter(
-                primaryShared[localIndex],
-                primaryShared[localIndex + stride]);
-            shadowShared[localIndex] = AddCounter(
-                shadowShared[localIndex],
-                shadowShared[localIndex + stride]);
-            reflectionShared[localIndex] = AddCounter(
-                reflectionShared[localIndex],
-                reflectionShared[localIndex + stride]);
-            primitiveShared[localIndex] = AddCounter(
-                primitiveShared[localIndex],
-                primitiveShared[localIndex + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (localIndex == 0u)
-    {
-        GroupStatistics value;
-        value.PrimaryRays.Low = primaryShared[0].x;
-        value.PrimaryRays.High = primaryShared[0].y;
-        value.ShadowRays.Low = shadowShared[0].x;
-        value.ShadowRays.High = shadowShared[0].y;
-        value.ReflectionRays.Low = reflectionShared[0].x;
-        value.ReflectionRays.High = reflectionShared[0].y;
-        value.PrimitiveTests.Low = primitiveShared[0].x;
-        value.PrimitiveTests.High = primitiveShared[0].y;
-        groupStatistics[groupPosition.x] = value;
-    }
-}
-
-kernel void ArvoResolvePixels(
-    device const float4* accumulation [[buffer(0)]],
-    device const uint* sampleCounts [[buffer(1)]],
-    device uint* outputPixels [[buffer(2)]],
-    constant FrameConstants& constants [[buffer(3)]],
-    uint gridIndex [[thread_position_in_grid]])
-{
-    if (gridIndex >= constants.PixelCount)
-    {
-        return;
-    }
-    const uint pixelIndex = constants.PixelBegin + gridIndex;
-    const uint sampleCount = sampleCounts[pixelIndex];
-    float3 color = float3(0.0f);
-    if (sampleCount != 0u)
-    {
-        color = max(
-            accumulation[pixelIndex].xyz / float(sampleCount),
-            float3(0.0f));
-        color /= max(1.0f, max(color.r, max(color.g, color.b)));
-        if (constants.GammaCorrection != 0u)
-        {
-            color = LinearToSRGB(color);
-        }
-    }
-    const uint3 packed = uint3(color * 255.0f + 0.5f);
-    outputPixels[pixelIndex] =
-        packed.x | (packed.y << 8u) | (packed.z << 16u) | 0xff000000u;
-}
-)MSL";
 
 [[nodiscard]] std::string ErrorDescription(NSError* error, const char* fallback)
 {
@@ -1968,12 +599,45 @@ struct MetalRayTracingRHI::Impl
                 }
                 @autoreleasepool
                 {
-                    return RenderNative(
-                        *scene,
-                        owner,
-                        camera,
-                        settings,
-                        cancellation);
+                    if (settings.Micropolygons.Enabled)
+                    {
+                        auto diced = Detail::PrepareMicropolygons(
+                            *scene, camera, settings, cancellation,
+                            [&](const auto& controls, const auto& patches, const auto& ranges, auto& words,
+                                auto& error) {
+                                return MicropolygonPassNative(controls, patches, ranges, words, cancellation,
+                                                              error);
+                            });
+                        if (diced.Status != RenderStatus::Completed)
+                            return diced.Status == RenderStatus::Cancelled
+                                       ? Detail::MakeCancelledResult()
+                                       : Detail::MakeFailedResult(diced.Error);
+                        owner = std::move(diced.Geometry);
+                        scene = owner.get();
+                        settings.Micropolygons.Enabled = false;
+                        settings.DicingPlan.reset();
+                    }
+                    Detail::SpatialGuideCache spatialGuides;
+                    return Detail::RenderWithDenoisedSampling(
+                        *scene, camera, settings, cancellation, [&](const RenderSettings &expanded)
+                        { return RenderNative(*scene, owner, camera, expanded, cancellation); },
+                        [&](const RenderSettings &raster, const LinearFilm &film, ReconstructedImage &image,
+                            std::string &error)
+                        {
+                            const GeometryGuideImage *guides = nullptr;
+                            if (settings.Reconstruction.GeometryGuidance)
+                            {
+                                guides = spatialGuides.Get(
+                                    raster,
+                                    [&] { return CaptureGuidesNative(*scene, camera, raster, cancellation); },
+                                    error);
+                                if (!guides)
+                                    return false;
+                            }
+                            return ReconstructNative(film, settings, guides, cancellation, image, error);
+                        },
+                        [&](const auto &input, auto controls, auto &counts, auto &error)
+                        { return AllocateDenoisedNative(input, controls, cancellation, counts, error); });
                 }
             });
     }
@@ -1996,69 +660,12 @@ struct MetalRayTracingRHI::Impl
                 return false;
             }
 
-            NSError* error = nil;
-            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
-            options.fastMathEnabled = NO;
-            NSString* source = [NSString stringWithUTF8String:MetalShaderSource];
-            id<MTLLibrary> library = [Device
-                newLibraryWithSource:source
-                options:options
-                error:&error];
-            ReleaseObject(options);
-            if (library == nil)
-            {
-                SetUnavailable(ErrorDescription(
-                    error,
-                    "Metal ray tracing shader compilation failed."));
+            if (!CreatePipeline(Detail::MetalWhittedSource, @"ArvoTracePixels", WhittedPipeline)
+                || !CreatePipeline(Detail::MetalWhittedSource, @"ArvoQueryRays", QueryPipeline)
+                || !CreatePipeline(Detail::MetalPathTracingSource, @"ArvoTracePixels", PathTracingPipeline)
+                || !CreatePipeline(Detail::MetalDistributedRaySource, @"ArvoTracePixels", DistributedRayPipeline)
+                || !CreatePipeline(Detail::MetalFilmSource, @"ArvoResolvePixels", ResolvePipeline))
                 return false;
-            }
-
-            id<MTLFunction> traceFunction =
-                [library newFunctionWithName:@"ArvoTracePixels"];
-            id<MTLFunction> resolveFunction =
-                [library newFunctionWithName:@"ArvoResolvePixels"];
-            if (traceFunction == nil || resolveFunction == nil)
-            {
-                SetUnavailable(
-                    "The Metal ray tracing library is missing a compute entry point.");
-                ReleaseObject(traceFunction);
-                ReleaseObject(resolveFunction);
-                ReleaseObject(library);
-                return false;
-            }
-
-            TracePipeline = [Device
-                newComputePipelineStateWithFunction:traceFunction
-                error:&error];
-            if (TracePipeline == nil)
-            {
-                SetUnavailable(ErrorDescription(
-                    error,
-                    "Metal trace pipeline creation failed."));
-            }
-            ResolvePipeline = [Device
-                newComputePipelineStateWithFunction:resolveFunction
-                error:&error];
-            if (ResolvePipeline == nil)
-            {
-                SetUnavailable(ErrorDescription(
-                    error,
-                    "Metal resolve pipeline creation failed."));
-            }
-            ReleaseObject(traceFunction);
-            ReleaseObject(resolveFunction);
-            ReleaseObject(library);
-            if (TracePipeline == nil || ResolvePipeline == nil)
-            {
-                return false;
-            }
-            if (TracePipeline.maxTotalThreadsPerThreadgroup < ThreadsPerGroup
-                || ResolvePipeline.maxTotalThreadsPerThreadgroup < ThreadsPerGroup)
-            {
-                SetUnavailable(
-                    "The Metal device does not support 256-thread compute groups.");
-                return false;
-            }
 
             const char* name = [[Device name] UTF8String];
             SetAvailable(name != nullptr ? name : "Unknown Metal Device");
@@ -2066,18 +673,101 @@ struct MetalRayTracingRHI::Impl
         }
     }
 
+    bool CreatePipeline(const char* source, NSString* entryPoint, id<MTLComputePipelineState>& pipeline)
+    {
+        NSError* error = nil;
+        MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+        options.fastMathEnabled = NO;
+        id<MTLLibrary> library = [Device
+            newLibraryWithSource:[NSString stringWithUTF8String:source]
+            options:options error:&error];
+        ReleaseObject(options);
+        if (library == nil)
+        {
+            SetUnavailable(ErrorDescription(error, "Metal integrator compilation failed."));
+            return false;
+        }
+        id<MTLFunction> function = [library newFunctionWithName:entryPoint];
+        if (function != nil)
+            pipeline = [Device newComputePipelineStateWithFunction:function error:&error];
+        ReleaseObject(function);
+        ReleaseObject(library);
+        if (pipeline == nil)
+        {
+            SetUnavailable(ErrorDescription(error, "Metal integrator pipeline creation failed."));
+            return false;
+        }
+        if (pipeline.maxTotalThreadsPerThreadgroup < ThreadsPerGroup)
+        {
+            SetUnavailable("The Metal device does not support the required compute group size.");
+            return false;
+        }
+        return true;
+    }
+
     void Shutdown()
     {
         SetUnavailable("The Metal compute backend has been shut down.");
         CachedOwner.reset();
         ReleaseFrameBuffers();
+        SpectralFallback.Reset();
         ReleaseSceneBuffers();
-        ReleaseObject(TracePipeline);
+        ReleaseObject(WhittedPipeline);
+        ReleaseObject(QueryPipeline);
+        ReleaseObject(PathTracingPipeline);
+        ReleaseObject(DistributedRayPipeline);
         ReleaseObject(ResolvePipeline);
+        ReleaseObject(SpectralResponsePipeline);
+        ReleaseObject(SpectralPalettePipeline);
+        SpectralResponsePipeline = SpectralPalettePipeline = nil;
+        ReleaseObject(SpatialDenoisePipeline);
+        SpatialDenoisePipeline = nil;
+        ReleaseObject(AdaptiveDenoisePipeline);
+        AdaptiveDenoisePipeline = nil;
+        ReleaseObject(TemporalDenoisePipeline);
+        ReleaseObject(DicingPipeline);
+        TemporalDenoisePipeline = nil;
+        for (auto& pipeline : GeometryGuidePipelines)
+        {
+            ReleaseObject(pipeline);
+            pipeline = nil;
+        }
+        for (auto& pipeline : VcmPipelines)
+        {
+            ReleaseObject(pipeline);
+            pipeline = nil;
+        }
+        ReleaseObject(BidirectionalPairs);
+        ReleaseObject(BidirectionalClear);
+        ReleaseObject(BidirectionalCommit);
+        for (auto& pipeline : MetropolisPipelines)
+        {
+            ReleaseObject(pipeline);
+            pipeline = nil;
+        }
+        for (auto& pipeline : PhotonPipelines)
+        {
+            ReleaseObject(pipeline);
+            pipeline = nil;
+        }
+        for (auto& pipeline : ProgressivePipelines)
+        {
+            ReleaseObject(pipeline);
+            pipeline = nil;
+        }
+        for (auto& pipeline : PointGiPipelines)
+        {
+            ReleaseObject(pipeline);
+            pipeline = nil;
+        }
         ReleaseObject(CommandQueue);
         ReleaseObject(Device);
-        TracePipeline = nil;
+        WhittedPipeline = nil;
+        QueryPipeline = nil;
+        PathTracingPipeline = nil;
+        DistributedRayPipeline = nil;
         ResolvePipeline = nil;
+        BidirectionalPairs = BidirectionalClear = BidirectionalCommit = nil;
         CommandQueue = nil;
         Device = nil;
     }
@@ -2231,6 +921,10 @@ struct MetalRayTracingRHI::Impl
 
     void ReleaseSceneBuffers() const
     {
+        InstanceRecords.Reset();
+        InstanceNodes.Reset();
+        InstanceError.Reset();
+        InstanceNodeCount = 0u;
         Nodes.Reset();
         PrimitiveRefs.Reset();
         Triangles.Reset();
@@ -2239,6 +933,8 @@ struct MetalRayTracingRHI::Impl
         Lights.Reset();
         TextureDescriptors.Reset();
         TextureTexels.Reset();
+        SpectralPalette.Reset();
+        SpectralReferences.Reset();
         NodeCount = 0u;
         PrimitiveRefCount = 0u;
         TriangleCount = 0u;
@@ -2254,6 +950,7 @@ struct MetalRayTracingRHI::Impl
     {
         Accumulation.Reset();
         SampleCounts.Reset();
+        SampleTargets.Reset();
         Output.Reset();
         GroupStats.Reset();
         FramePixelCapacity = 0u;
@@ -2270,21 +967,235 @@ struct MetalRayTracingRHI::Impl
         return cached && cached.get() == owner.get();
     }
 
-    [[nodiscard]] bool EnsureScene(
-        const Scene& scene,
-        const std::shared_ptr<const Scene>& owner,
-        const Detail::CancellationProbe& cancellation,
-        std::string& error) const
+    bool EnsureSpectralPipelines(std::string& error) const
     {
-        if (OwnerMatches(owner))
+        if (SpectralResponsePipeline && SpectralPalettePipeline)
+            return true;
+        @autoreleasepool
         {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.fastMathEnabled = NO;
+            id<MTLLibrary> library = [Device
+                newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalSpectralPrepareSource]
+                             options:options
+                               error:&detail];
+            ReleaseObject(options);
+            if (!library)
+            {
+                error = ErrorDescription(detail, "Metal spectral preparation compilation failed.");
+                return false;
+            }
+            id<MTLComputePipelineState> response = nil, palette = nil;
+            const auto create = [&](NSString* name, id<MTLComputePipelineState>& pipeline) {
+                id<MTLFunction> function = [library newFunctionWithName:name];
+                if (function)
+                    pipeline = [Device newComputePipelineStateWithFunction:function error:&detail];
+                ReleaseObject(function);
+                constexpr NSUInteger FitThreads = 64;
+                if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < FitThreads)
+                {
+                    error = ErrorDescription(
+                        detail, "Metal spectral preparation cannot create its threadgroup pipeline.");
+                    return false;
+                }
+                return true;
+            };
+            const bool ready =
+                create(@"SpectralPrepareResponse", response) && create(@"SpectralPreparePalette", palette);
+            ReleaseObject(library);
+            if (!ready)
+            {
+                ReleaseObject(response);
+                ReleaseObject(palette);
+                return false;
+            }
+            ReleaseObject(SpectralResponsePipeline);
+            ReleaseObject(SpectralPalettePipeline);
+            SpectralResponsePipeline = response;
+            SpectralPalettePipeline = palette;
             return true;
         }
+    }
+
+    bool PrepareSpectralCoefficients(const SpectralSceneData::Request* sources, uint32_t count,
+                                     const Detail::CancellationProbe& cancellation, Buffer& output,
+                                     std::string& error) const
+    {
+        namespace S = SpectralSceneData;
+        constexpr uint32_t ResponseCount = 256, FitThreads = 64, BatchSize = 8192, FitConverged = 0;
+        if (!count || !EnsureSpectralPipelines(error))
+        {
+            if (!count)
+                error = "Metal spectral preparation needs a nonempty palette.";
+            return false;
+        }
+        const size_t inputBytes = size_t(count) * sizeof(S::Request);
+        const size_t outputBytes = size_t(count) * sizeof(S::GpuSpectrum);
+        if (std::max(inputBytes, outputBytes) > Device.maxBufferLength)
+        {
+            error = "Metal spectral palette exceeds the device buffer limit.";
+            return false;
+        }
+        Buffer input, response, coefficients;
+        if (!CreateBuffer(input, inputBytes, sources, "Arvo Metal spectral source colors", error) ||
+            !CreateBuffer(response, ResponseCount * sizeof(Vec4), nullptr, "Arvo Metal spectral quadrature",
+                          error) ||
+            !CreateBuffer(coefficients, outputBytes, nullptr, "Arvo Metal spectral coefficients", error))
+            return false;
+        if (cancellation())
+        {
+            error = "Metal spectral preparation cancelled.";
+            return false;
+        }
+        @autoreleasepool
+        {
+            id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+            id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+            if (!command || !encoder)
+            {
+                error = "Metal spectral quadrature encoder is unavailable.";
+                return false;
+            }
+            [encoder setComputePipelineState:SpectralResponsePipeline];
+            [encoder setBuffer:response.Handle offset:0 atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake((ResponseCount + FitThreads - 1) / FitThreads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(FitThreads, 1, 1)];
+            [encoder endEncoding];
+            if (!CommitAndWait(command, "Metal spectral quadrature", cancellation, error))
+                return false;
+        }
+        for (uint32_t first = 0; first < count;)
+        {
+            if (cancellation())
+            {
+                error = "Metal spectral fitting cancelled.";
+                return false;
+            }
+            const uint32_t batch = std::min(BatchSize, count - first);
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (!command || !encoder)
+                {
+                    error = "Metal spectral fit encoder is unavailable.";
+                    return false;
+                }
+                [encoder setComputePipelineState:SpectralPalettePipeline];
+                [encoder setBuffer:input.Handle offset:size_t(first) * sizeof(S::Request) atIndex:0];
+                [encoder setBuffer:response.Handle offset:0 atIndex:1];
+                [encoder setBuffer:coefficients.Handle
+                            offset:size_t(first) * sizeof(S::GpuSpectrum)
+                           atIndex:2];
+                [encoder setBytes:&batch length:sizeof(batch) atIndex:3];
+                [encoder dispatchThreadgroups:MTLSizeMake((batch + FitThreads - 1) / FitThreads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(FitThreads, 1, 1)];
+                [encoder endEncoding];
+                if (!CommitAndWait(command, "Metal spectral palette fitting", cancellation, error))
+                    return false;
+            }
+            const auto* data = static_cast<const S::GpuSpectrum*>(coefficients.Handle.contents);
+            if (!data)
+            {
+                error = "Metal spectral status is not CPU-visible.";
+                return false;
+            }
+            for (uint32_t index = first; index < first + batch; ++index)
+            {
+                const auto& fit = data[index];
+                if (fit.Status != FitConverged || !std::isfinite(fit.Quadratic) ||
+                    !std::isfinite(fit.Linear) || !std::isfinite(fit.Offset) || !std::isfinite(fit.Scale) ||
+                    !std::isfinite(fit.Constant) || !std::isfinite(fit.Error) || fit.Scale < 0 ||
+                    fit.Constant < 0 || fit.Error < 0)
+                {
+                    error = "Metal spectral fit failed at entry " + std::to_string(index);
+                    return false;
+                }
+            }
+            first += batch;
+        }
+        if (cancellation())
+        {
+            error = "Metal spectral coefficient publication cancelled.";
+            return false;
+        }
+        output = std::move(coefficients);
+        return true;
+    }
+
+    bool UpdateSpectralMedium(const MediumOptions& medium, const Detail::CancellationProbe& cancellation,
+                              std::string& error) const
+    {
+        if (SpectralMedium == medium)
+            return true;
+        namespace S = SpectralSceneData;
+        const S::Request sources[]{{medium.Enabled ? medium.Absorption : Float3(), S::Role::Nonnegative},
+                                   {medium.Enabled ? medium.Scattering : Float3(), S::Role::Nonnegative}};
+        Buffer candidate;
+        if (!PrepareSpectralCoefficients(sources, uint32_t(std::size(sources)), cancellation, candidate,
+                                         error))
+            return false;
+        if (cancellation())
+        {
+            error = "Metal spectral medium publication cancelled.";
+            return false;
+        }
+        auto* destination = static_cast<S::GpuSpectrum*>(SpectralPalette.Handle.contents);
+        const void* source = candidate.Handle.contents;
+        if (!destination || !source)
+        {
+            error = "Metal spectral medium buffers are not CPU-visible.";
+            return false;
+        }
+        // The queue is serialized and the fit command has completed. Shared
+        // storage needs no managed-memory synchronization for this small update.
+        std::memcpy(destination + SpectralSceneSourceCount, source, candidate.LogicalSize);
+        SpectralMedium = medium;
+        return true;
+    }
+
+    [[nodiscard]] bool EnsureScene(const Scene& scene, const std::shared_ptr<const Scene>& owner,
+                                   AccelerationOptions acceleration,
+                                   const Detail::CancellationProbe& cancellation, std::string& error,
+                                   const MediumOptions* spectralMedium = nullptr) const
+    {
+        if (OwnerMatches(owner) && CachedAcceleration == acceleration &&
+            (!spectralMedium || SpectralPalette.Handle != nil))
+        {
+            return !spectralMedium || UpdateSpectralMedium(*spectralMedium, cancellation, error);
+        }
         PackedScene packed;
-        ScenePacker packer(cancellation);
-        if (!packer.Pack(scene, packed, error))
+        if (!MetalScene::Pack(scene, acceleration, cancellation, packed, error))
         {
             return false;
+        }
+        SpectralSceneData::GpuScene spectral;
+        Buffer spectralPalette, spectralReferences;
+        if (spectralMedium)
+        {
+            if (MetalSpectralHost::BuildGpuInputs(scene, *spectralMedium, cancellation, spectral, error) !=
+                RenderStatus::Completed)
+                return false;
+            for (auto& triangle : packed.Triangles)
+            {
+                const auto& a = triangle.Color0;
+                const auto& b = triangle.Color1;
+                const auto& c = triangle.Color2;
+                const auto link =
+                    spectral.TriangleReferences.find({a.X, a.Y, a.Z, b.X, b.Y, b.Z, c.X, c.Y, c.Z});
+                if (link == spectral.TriangleReferences.end())
+                {
+                    error = "Metal packed vertex colors do not match the spectral scene.";
+                    return false;
+                }
+                triangle.Padding0 = link->second;
+            }
+            if (!PrepareSpectralCoefficients(spectral.Sources.data(), uint32_t(spectral.Sources.size()),
+                                             cancellation, spectralPalette, error) ||
+                !CreateVectorBuffer(spectralReferences, spectral.References, "Arvo Metal spectral references",
+                                    error))
+                return false;
         }
         if (cancellation())
         {
@@ -2300,6 +1211,7 @@ struct MetalRayTracingRHI::Impl
         Buffer lights;
         Buffer textureDescriptors;
         Buffer textureTexels;
+        Buffer instanceRecords, instanceNodes, instanceError;
         if (!CreateVectorBuffer(nodes, packed.Nodes, "Arvo Metal BVH nodes", error)
             || !CreateVectorBuffer(
                 primitiveRefs,
@@ -2335,7 +1247,10 @@ struct MetalRayTracingRHI::Impl
                 textureTexels,
                 packed.TextureAtlas.Texels,
                 "Arvo Metal texture texels",
-                error))
+                error)
+            || !CreateVectorBuffer(instanceRecords, packed.Instances, "Arvo Metal instance records", error)
+            || !CreateVectorBuffer(instanceNodes, packed.InstanceNodes, "Arvo Metal instance TLAS", error)
+            || !CreateBuffer(instanceError, sizeof(uint32_t), nullptr, "Arvo Metal traversal error", error))
         {
             return false;
         }
@@ -2346,6 +1261,10 @@ struct MetalRayTracingRHI::Impl
         }
 
         ReleaseSceneBuffers();
+        InstanceRecords = std::move(instanceRecords);
+        InstanceNodes = std::move(instanceNodes);
+        InstanceError = std::move(instanceError);
+        InstanceNodeCount = uint32_t(packed.InstanceNodes.size());
         Nodes = std::move(nodes);
         PrimitiveRefs = std::move(primitiveRefs);
         Triangles = std::move(triangles);
@@ -2366,6 +1285,12 @@ struct MetalRayTracingRHI::Impl
         TextureTexelCount = static_cast<std::uint32_t>(
             packed.TextureAtlas.Texels.size());
         CachedOwner = owner;
+        CachedAcceleration = acceleration;
+        SpectralPalette = std::move(spectralPalette);
+        SpectralReferences = std::move(spectralReferences);
+        SpectralSceneSourceCount = spectral.SceneSourceCount;
+        if (spectralMedium)
+            SpectralMedium = *spectralMedium;
         return true;
     }
 
@@ -2373,6 +1298,13 @@ struct MetalRayTracingRHI::Impl
         std::uint32_t pixelCount,
         std::string& error) const
     {
+        if (!SpectralFallback.Handle)
+        {
+            const SpectralSceneData::GpuSpectrum zero{};
+            if (!CreateBuffer(SpectralFallback, sizeof(zero), &zero, "Arvo Metal RGB spectral fallback",
+                              error))
+                return false;
+        }
         if (FramePixelCapacity >= pixelCount)
         {
             return true;
@@ -2385,6 +1317,7 @@ struct MetalRayTracingRHI::Impl
 
         Buffer accumulation;
         Buffer sampleCounts;
+        Buffer sampleTargets;
         Buffer output;
         Buffer groupStats;
         const std::size_t groupCapacity =
@@ -2400,6 +1333,12 @@ struct MetalRayTracingRHI::Impl
                 static_cast<std::size_t>(pixelCount) * sizeof(std::uint32_t),
                 nullptr,
                 "Arvo Metal sample counts",
+                error)
+            || !CreateBuffer(
+                sampleTargets,
+                static_cast<std::size_t>(pixelCount) * sizeof(std::uint32_t),
+                nullptr,
+                "Arvo Metal sample targets",
                 error)
             || !CreateBuffer(
                 output,
@@ -2419,6 +1358,7 @@ struct MetalRayTracingRHI::Impl
         ReleaseFrameBuffers();
         Accumulation = std::move(accumulation);
         SampleCounts = std::move(sampleCounts);
+        SampleTargets = std::move(sampleTargets);
         Output = std::move(output);
         GroupStats = std::move(groupStats);
         FramePixelCapacity = pixelCount;
@@ -2432,7 +1372,8 @@ struct MetalRayTracingRHI::Impl
     {
         void* accumulation = Accumulation.Handle.contents;
         void* sampleCounts = SampleCounts.Handle.contents;
-        if (accumulation == nullptr || sampleCounts == nullptr)
+        void* sampleTargets = SampleTargets.Handle.contents;
+        if (accumulation == nullptr || sampleCounts == nullptr || sampleTargets == nullptr)
         {
             error = "Metal frame buffers are not CPU-visible.";
             return false;
@@ -2467,16 +1408,47 @@ struct MetalRayTracingRHI::Impl
                 static_cast<std::uint8_t*>(sampleCounts) + offset,
                 0,
                 std::min(ClearChunkSize, sampleBytes - offset));
+            std::memset(
+                static_cast<std::uint8_t*>(sampleTargets) + offset,
+                0,
+                std::min(ClearChunkSize, sampleBytes - offset));
         }
         return true;
     }
 
-    [[nodiscard]] bool DispatchTrace(
-        const FrameConstants& constants,
-        GroupStatistics& totals,
-        const Detail::CancellationProbe& cancellation,
-        std::string& error) const
+    bool ResetTraversalError(std::string& error) const
     {
+        void* value = InstanceError.Handle.contents;
+        if (!value)
+        {
+            error = "Metal traversal error buffer is not CPU-visible.";
+            return false;
+        }
+        std::memset(value, 0, sizeof(uint32_t));
+        return true;
+    }
+
+    bool CheckTraversalError(std::string& error) const
+    {
+        uint32_t value = 0;
+        std::memcpy(&value, InstanceError.Handle.contents, sizeof(value));
+        if (value == 0) return true;
+        error = "Metal affine ray or normal exceeds native primitive arithmetic range.";
+        return false;
+    }
+
+    void BindInstanceBuffers(id<MTLComputeCommandEncoder> encoder) const
+    {
+        [encoder setBuffer:InstanceRecords.Handle offset:0u atIndex:InstanceRecordBinding];
+        [encoder setBuffer:InstanceNodes.Handle offset:0u atIndex:InstanceNodeBinding];
+        [encoder setBuffer:InstanceError.Handle offset:0u atIndex:InstanceErrorBinding];
+    }
+
+    [[nodiscard]] bool DispatchTrace(const FrameConstants& constants, const MediumData& medium,
+                                     const MotionData::FrameExposure& cameraExposure, GroupStatistics& totals,
+                                     const Detail::CancellationProbe& cancellation, std::string& error) const
+    {
+        if (!ResetTraversalError(error)) return false;
         @autoreleasepool
         {
             id<MTLCommandBuffer> commandBuffer = [CommandQueue commandBuffer];
@@ -2492,7 +1464,40 @@ struct MetalRayTracingRHI::Impl
                 error = "Metal trace dispatch did not create a compute encoder.";
                 return false;
             }
-            [encoder setComputePipelineState:TracePipeline];
+            id<MTLComputePipelineState> pipeline = nil;
+            switch (static_cast<Algorithm>(constants.Integrator))
+            {
+            case Algorithm::RayTracing: pipeline = WhittedPipeline; break;
+            case Algorithm::PathTracing: pipeline = PathTracingPipeline; break;
+            case Algorithm::DistributedRayTracing: pipeline = DistributedRayPipeline; break;
+            default:
+                [encoder endEncoding];
+                error = "No native Metal pipeline for the integrator";
+                return false;
+            }
+            [encoder setComputePipelineState:pipeline];
+            if (constants.Integrator == uint32_t(Algorithm::PathTracing))
+            {
+                constexpr NSUInteger MediumBinding = 16;
+                [encoder setBytes:&medium length:sizeof(medium) atIndex:MediumBinding];
+                constexpr NSUInteger CameraExposureBinding = 19;
+                [encoder setBytes:&cameraExposure
+                           length:sizeof(cameraExposure)
+                          atIndex:CameraExposureBinding];
+                constexpr NSUInteger SpectralPaletteBinding = 17, SpectralReferenceBinding = 18;
+                [encoder setBuffer:SpectralPalette.Handle ? SpectralPalette.Handle : SpectralFallback.Handle
+                            offset:0
+                           atIndex:SpectralPaletteBinding];
+                [encoder
+                    setBuffer:SpectralReferences.Handle ? SpectralReferences.Handle : SpectralFallback.Handle
+                       offset:0
+                      atIndex:SpectralReferenceBinding];
+            }
+            if (constants.Integrator == uint32_t(Algorithm::DistributedRayTracing))
+            {
+                constexpr NSUInteger CameraExposureBinding = 19;
+                [encoder setBytes:&cameraExposure length:sizeof(cameraExposure) atIndex:CameraExposureBinding];
+            }
             [encoder setBuffer:Nodes.Handle offset:0u atIndex:0u];
             [encoder setBuffer:PrimitiveRefs.Handle offset:0u atIndex:1u];
             [encoder setBuffer:Triangles.Handle offset:0u atIndex:2u];
@@ -2508,6 +1513,8 @@ struct MetalRayTracingRHI::Impl
             [encoder setBuffer:GroupStats.Handle offset:0u atIndex:9u];
             [encoder setBuffer:TextureDescriptors.Handle offset:0u atIndex:10u];
             [encoder setBuffer:TextureTexels.Handle offset:0u atIndex:11u];
+            [encoder setBuffer:SampleTargets.Handle offset:0u atIndex:12u];
+            BindInstanceBuffers(encoder);
             [encoder
                 dispatchThreadgroups:MTLSizeMake(constants.GroupCount, 1u, 1u)
                 threadsPerThreadgroup:MTLSizeMake(ThreadsPerGroup, 1u, 1u)];
@@ -2520,6 +1527,7 @@ struct MetalRayTracingRHI::Impl
             {
                 return false;
             }
+            if (!CheckTraversalError(error)) return false;
             if (cancellation())
             {
                 error = "Metal trace dispatch was cancelled.";
@@ -2608,6 +1616,1956 @@ struct MetalRayTracingRHI::Impl
         return true;
     }
 
+    [[nodiscard]] RayQueryResult QueryNative(const Scene& scene, const std::vector<Ray>& rays, AccelerationOptions acceleration,
+        const Detail::CancellationProbe& cancellation) const
+    {
+        RayQueryResult result;
+        if (!ValidateAcceleration(acceleration, result.Error)
+                || !ValidateRayQueries(rays, result.Error)
+            || !ValidateInput(scene, Camera{}, RenderSettings{}, result.Error, false)) return result;
+        if (cancellation()) { result.Status = RenderStatus::Cancelled; return result; }
+        if (rays.empty()) { result.Status = RenderStatus::Completed; return result; }
+        if (!EnsureScene(scene, {}, acceleration, cancellation, result.Error))
+        {
+            if (cancellation()) result.Status = RenderStatus::Cancelled;
+            return result;
+        }
+        std::vector<QueryRay> input;
+        input.reserve(rays.size());
+        for (const Ray& ray : rays)
+            input.push_back({{ray.Origin.X, ray.Origin.Y, ray.Origin.Z, ray.MinDistance},
+                {ray.Direction.X, ray.Direction.Y, ray.Direction.Z, ray.MaxDistance}});
+        Buffer queryInput, queryOutput;
+        if (!CreateVectorBuffer(queryInput, input, "Arvo Metal query rays", result.Error)
+            || !CreateBuffer(queryOutput, input.size() * sizeof(RayQueryHit), nullptr,
+                "Arvo Metal query hits", result.Error)) return result;
+        FrameConstants constants;
+        constants.Acceleration = static_cast<std::uint32_t>(acceleration.Type);
+        constants.NodeCount = NodeCount;
+        constants.InstanceNodeCount = InstanceNodeCount;
+        constants.PrimitiveRefCount = PrimitiveRefCount;
+        constants.TriangleCount = TriangleCount;
+        constants.SphereCount = SphereCount;
+        for (std::uint32_t begin = 0; begin < input.size(); begin += PixelChunkSize)
+        {
+            if (cancellation()) { result.Status = RenderStatus::Cancelled; return result; }
+            constants.PixelBegin = begin;
+            constants.PixelCount = std::min(PixelChunkSize, static_cast<std::uint32_t>(input.size()) - begin);
+            if (!ResetTraversalError(result.Error)) return result;
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> commandBuffer = [CommandQueue commandBuffer];
+                if (commandBuffer == nil) { result.Error = "Metal query did not create a command buffer."; return result; }
+                id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+                if (encoder == nil) { result.Error = "Metal query did not create a compute encoder."; return result; }
+                [encoder setComputePipelineState:QueryPipeline];
+                [encoder setBuffer:Nodes.Handle offset:0u atIndex:0u];
+                [encoder setBuffer:PrimitiveRefs.Handle offset:0u atIndex:1u];
+                [encoder setBuffer:Triangles.Handle offset:0u atIndex:2u];
+                [encoder setBuffer:Spheres.Handle offset:0u atIndex:3u];
+                [encoder setBytes:&constants length:sizeof(constants) atIndex:4u];
+                [encoder setBuffer:queryInput.Handle offset:0u atIndex:5u];
+                [encoder setBuffer:queryOutput.Handle offset:0u atIndex:6u];
+                BindInstanceBuffers(encoder);
+                const std::uint32_t groups = (constants.PixelCount + ThreadsPerGroup - 1u) / ThreadsPerGroup;
+                [encoder dispatchThreadgroups:MTLSizeMake(groups, 1u, 1u)
+                    threadsPerThreadgroup:MTLSizeMake(ThreadsPerGroup, 1u, 1u)];
+                [encoder endEncoding];
+                if (!CommitAndWait(commandBuffer, "Metal ray queries", cancellation, result.Error))
+                {
+                    if (cancellation()) result.Status = RenderStatus::Cancelled;
+                    return result;
+                }
+                if (!CheckTraversalError(result.Error)) return result;
+            }
+        }
+        const void* hits = queryOutput.Handle.contents;
+        if (hits == nullptr) { result.Error = "Metal query hits are not CPU-visible."; return result; }
+        result.Hits.resize(rays.size());
+        constexpr size_t ReadbackChunkSize = 32u * 1024u * 1024u;
+        const size_t bytes = result.Hits.size() * sizeof(RayQueryHit);
+        for (size_t offset = 0; offset < bytes; offset += ReadbackChunkSize)
+        {
+            if (cancellation()) { result.Status = RenderStatus::Cancelled; return result; }
+            std::memcpy(reinterpret_cast<std::uint8_t*>(result.Hits.data()) + offset,
+                static_cast<const std::uint8_t*>(hits) + offset, std::min(ReadbackChunkSize, bytes - offset));
+        }
+        result.Status = cancellation() ? RenderStatus::Cancelled : RenderStatus::Completed;
+        return result;
+    }
+
+    bool EnsureBidirectionalPipelines(std::string& error) const
+    {
+        if (BidirectionalPairs && BidirectionalClear && BidirectionalCommit)
+            return true;
+        @autoreleasepool
+        {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.fastMathEnabled = NO;
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalBidirectionalSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (!library)
+            {
+                error = ErrorDescription(detail, "Metal BDPT compilation failed.");
+                return false;
+            }
+            id<MTLComputePipelineState> pairs = nil, clear = nil, commit = nil;
+            auto create = [&](NSString* name, id<MTLComputePipelineState>& pipeline) {
+                id<MTLFunction> function = [library newFunctionWithName:name];
+                if (function)
+                    pipeline = [Device newComputePipelineStateWithFunction:function error:&detail];
+                ReleaseObject(function);
+                if (!pipeline)
+                {
+                    error = ErrorDescription(detail, "Metal BDPT pipeline creation failed.");
+                    return false;
+                }
+                if (pipeline.maxTotalThreadsPerThreadgroup < MetalBdpt::ThreadsPerGroup)
+                {
+                    error = "Metal BDPT pipeline cannot support its requested threadgroup size.";
+                    return false;
+                }
+                return true;
+            };
+            const bool ready = create(@"ArvoBidirectionalPairs", pairs) &&
+                               create(@"ArvoBidirectionalClear", clear) &&
+                               create(@"ArvoBidirectionalCommit", commit);
+            ReleaseObject(library);
+            if (!ready)
+            {
+                ReleaseObject(pairs);
+                ReleaseObject(clear);
+                ReleaseObject(commit);
+                return false;
+            }
+            // The serialized Metal queue publishes all three pipelines together.
+            BidirectionalPairs = pairs;
+            BidirectionalClear = clear;
+            BidirectionalCommit = commit;
+            return true;
+        }
+    }
+
+    bool RenderBidirectional(const Scene& scene, FrameConstants constants,
+                             const Detail::CancellationProbe& cancellation, RenderResult& result) const
+    {
+        if (!EnsureBidirectionalPipelines(result.Error))
+            return false;
+        const auto emission = MetalEmission::PrepareEmitters(scene);
+        for (const auto& source : emission.Sources)
+            if (!(source.Flags & EmitterCastsShadows))
+            {
+                result.Error = "Metal BDPT requires shadow casting on every emitter.";
+                return false;
+            }
+        const uint32_t pixels = constants.Width * constants.Height;
+        const uint32_t fullPixels = constants.FullWidth * constants.FullHeight;
+        const uint32_t capacity = std::min(MetalBdpt::BatchCapacity, fullPixels);
+        const size_t vertexBytes = size_t(capacity) * MetalBdpt::PairSubpaths * MetalBdpt::MaximumVertices *
+                                   sizeof(MetalBdpt::Vertex);
+        Buffer emitters, vertices, pass, statistics, failures;
+        if (!CreateVectorBuffer(emitters, emission.Sources, "Arvo Metal BDPT sources", result.Error) ||
+            !CreateBuffer(vertices, vertexBytes, nullptr, "Arvo Metal BDPT vertices", result.Error) ||
+            !CreateBuffer(pass, size_t(pixels) * MetalBdpt::PassPixelBytes, nullptr, "Arvo Metal BDPT pass",
+                          result.Error) ||
+            !CreateBuffer(statistics, size_t(capacity) * sizeof(GroupStatistics), nullptr,
+                          "Arvo Metal BDPT counters", result.Error) ||
+            !CreateBuffer(failures, sizeof(uint32_t), nullptr, "Arvo Metal BDPT numerical status",
+                          result.Error))
+            return false;
+        MetalBdpt::Controls controls{{emission.Center.X, emission.Center.Y, emission.Center.Z},
+                                     emission.Radius,
+                                     uint32_t(emission.Sources.size()),
+                                     0,
+                                     0,
+                                     0};
+        auto dispatch = [&](id<MTLComputePipelineState> pipeline, uint32_t threads) {
+            if (cancellation() || !ResetTraversalError(result.Error))
+                return false;
+            @autoreleasepool
+            {
+                // Default command buffers retain every bound resource, including
+                // these frame-local buffers, until asynchronous completion.
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (!command || !encoder)
+                {
+                    result.Error = "Metal BDPT could not create its command buffer or encoder.";
+                    return false;
+                }
+                [encoder setComputePipelineState:pipeline];
+                [encoder setBuffer:Nodes.Handle offset:0 atIndex:0];
+                [encoder setBuffer:PrimitiveRefs.Handle offset:0 atIndex:1];
+                [encoder setBuffer:Triangles.Handle offset:0 atIndex:2];
+                [encoder setBuffer:Spheres.Handle offset:0 atIndex:3];
+                [encoder setBuffer:Materials.Handle offset:0 atIndex:4];
+                [encoder setBuffer:emitters.Handle offset:0 atIndex:5];
+                [encoder setBytes:&constants length:sizeof(constants) atIndex:6];
+                [encoder setBuffer:Accumulation.Handle offset:0 atIndex:7];
+                [encoder setBuffer:SampleCounts.Handle offset:0 atIndex:8];
+                [encoder setBuffer:statistics.Handle offset:0 atIndex:9];
+                [encoder setBuffer:TextureDescriptors.Handle offset:0 atIndex:10];
+                [encoder setBuffer:TextureTexels.Handle offset:0 atIndex:11];
+                [encoder setBuffer:SampleTargets.Handle offset:0 atIndex:12];
+                BindInstanceBuffers(encoder);
+                [encoder setBuffer:vertices.Handle offset:0 atIndex:MetalBdpt::VertexBinding];
+                [encoder setBuffer:pass.Handle offset:0 atIndex:MetalBdpt::PassBinding];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:MetalBdpt::ControlsBinding];
+                [encoder setBuffer:failures.Handle offset:0 atIndex:MetalBdpt::ErrorBinding];
+                const uint32_t groups =
+                    (threads + MetalBdpt::ThreadsPerGroup - 1) / MetalBdpt::ThreadsPerGroup;
+                [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(MetalBdpt::ThreadsPerGroup, 1, 1)];
+                [encoder endEncoding];
+                if (!CommitAndWait(command, "Metal BDPT dispatch", cancellation, result.Error) ||
+                    !CheckTraversalError(result.Error))
+                    return false;
+            }
+            const void* status = failures.Handle.contents;
+            if (!status)
+            {
+                result.Error = "Metal BDPT numerical status is not CPU-visible.";
+                return false;
+            }
+            uint32_t flags;
+            std::memcpy(&flags, status, sizeof(flags));
+            if (flags)
+            {
+                result.Error = "Metal BDPT encountered nonfinite path or film arithmetic.";
+                return false;
+            }
+            return true;
+        };
+        // Light paths cover the full image even for a cropped output. Complete
+        // passes preserve incoming splats and Welford's observation count.
+        for (uint32_t sample = 0; sample < constants.TotalSamples; ++sample)
+        {
+            constants.SampleBegin = sample;
+            if (!dispatch(BidirectionalClear, pixels))
+                return false;
+            for (uint32_t begin = 0; begin < fullPixels; begin += capacity)
+            {
+                controls.FirstPath = begin;
+                controls.PathCount = std::min(capacity, fullPixels - begin);
+                if (!dispatch(BidirectionalPairs, controls.PathCount))
+                    return false;
+                const auto* rows = static_cast<const GroupStatistics*>(statistics.Handle.contents);
+                if (!rows)
+                {
+                    result.Error = "Metal BDPT statistics are not CPU-visible.";
+                    return false;
+                }
+                for (uint32_t i = 0; i < controls.PathCount; ++i)
+                {
+                    result.Statistics.PrimaryRays += rows[i].PrimaryRays.Value();
+                    result.Statistics.ShadowRays += rows[i].ShadowRays.Value();
+                    result.Statistics.ReflectionRays += rows[i].ReflectionRays.Value();
+                    result.Statistics.PrimitiveTests += rows[i].PrimitiveTests.Value();
+                }
+            }
+            if (!dispatch(BidirectionalCommit, pixels))
+                return false;
+        }
+        return true;
+    }
+
+    bool EnsureMetropolisPipelines(std::string& error) const
+    {
+        if (MetropolisPipelines[MetalMlt::BootstrapStage])
+            return true;
+        @autoreleasepool
+        {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            // WideMath's residuals require the exact arithmetic expression order.
+            options.fastMathEnabled = NO;
+            if (@available(macOS 11.0, *))
+                options.languageVersion = MTLLanguageVersion2_3;
+            else
+            {
+                ReleaseObject(options);
+                error = "Metal MLT requires macOS 11 or later for MSL 2.3 persistent 64-bit random state.";
+                return false;
+            }
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalMetropolisSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (!library)
+            {
+                error = ErrorDescription(detail, "Metal MLT compilation failed.");
+                return false;
+            }
+            NSString* entries[MetalMlt::StageCount] = {
+                @"ArvoMetropolisBootstrap", @"ArvoMetropolisDistribution", @"ArvoMetropolisInitialize",
+                @"ArvoMetropolisMutate",    @"ArvoMetropolisClear",        @"ArvoMetropolisCommit"};
+            id<MTLComputePipelineState> compiled[MetalMlt::StageCount] = {};
+            bool ready = true;
+            for (uint32_t stage = 0; stage < MetalMlt::StageCount && ready; ++stage)
+            {
+                id<MTLFunction> entry = [library newFunctionWithName:entries[stage]];
+                if (entry)
+                    compiled[stage] = [Device newComputePipelineStateWithFunction:entry error:&detail];
+                ReleaseObject(entry);
+                if (!compiled[stage])
+                {
+                    error = ErrorDescription(detail, "Metal MLT pipeline creation failed.");
+                    ready = false;
+                }
+                else if (compiled[stage].maxTotalThreadsPerThreadgroup < MetalMlt::ThreadsPerGroup)
+                {
+                    error = "Metal MLT pipeline cannot support its requested threadgroup size.";
+                    ready = false;
+                }
+            }
+            ReleaseObject(library);
+            if (!ready)
+            {
+                for (auto pipeline : compiled)
+                    ReleaseObject(pipeline);
+                return false;
+            }
+            // Publish only a complete set on the serialized RHI queue.
+            for (uint32_t stage = 0; stage < MetalMlt::StageCount; ++stage)
+                MetropolisPipelines[stage] = compiled[stage];
+            return true;
+        }
+    }
+
+    bool RenderMetropolis(const Scene& scene, FrameConstants constants, const MetropolisOptions& options,
+                          const Detail::CancellationProbe& cancellation, RenderResult& result) const
+    {
+        if (!EnsureMetropolisPipelines(result.Error))
+            return false;
+        const auto emission = MetalEmission::PrepareEmitters(scene);
+        for (const auto& source : emission.Sources)
+            if (!(source.Flags & EmitterCastsShadows))
+            {
+                result.Error = "Metal MLT requires shadow casting on every emitter.";
+                return false;
+            }
+        const uint32_t pixels = constants.Width * constants.Height,
+                       fullPixels = constants.FullWidth * constants.FullHeight;
+        const uint32_t chainCount = std::min(options.ChainCount, fullPixels);
+        Buffer emitters, chains, bootstrap, normalization, pass, statistics, failures;
+        if (!CreateVectorBuffer(emitters, emission.Sources, "Arvo Metal MLT emitters", result.Error) ||
+            !CreateBuffer(chains, size_t(chainCount) * sizeof(MetalMlt::Chain), nullptr,
+                          "Arvo Metal MLT chains", result.Error) ||
+            !CreateBuffer(bootstrap, size_t(options.BootstrapSamples) * sizeof(MetalMlt::Bootstrap), nullptr,
+                          "Arvo Metal MLT bootstrap", result.Error) ||
+            !CreateBuffer(normalization, sizeof(MetalMlt::Distribution), nullptr,
+                          "Arvo Metal MLT normalization", result.Error) ||
+            !CreateBuffer(pass, size_t(pixels) * sizeof(Vec4), nullptr, "Arvo Metal MLT pass",
+                          result.Error) ||
+            !CreateBuffer(statistics,
+                          size_t(std::max(MetalMlt::BootstrapBatch, chainCount)) * sizeof(GroupStatistics),
+                          nullptr, "Arvo Metal MLT counters", result.Error) ||
+            !CreateBuffer(failures, sizeof(uint32_t), nullptr, "Arvo Metal MLT numerical status",
+                          result.Error))
+            return false;
+        MetalMlt::Controls controls{{emission.Center.X, emission.Center.Y, emission.Center.Z},
+                                    emission.Radius,
+                                    uint32_t(emission.Sources.size()),
+                                    options.BootstrapSamples,
+                                    chainCount,
+                                    options.Seed ^ constants.SamplingSeed,
+                                    0,
+                                    0,
+                                    options.LargeStepProbability,
+                                    options.MutationScale};
+        auto dispatch = [&](uint32_t stage, uint32_t threads, uint32_t counterRows = 0) {
+            if (cancellation() || !ResetTraversalError(result.Error))
+                return false;
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (!command || !encoder)
+                {
+                    result.Error = "Metal MLT could not create its command buffer or encoder.";
+                    return false;
+                }
+                [encoder setComputePipelineState:MetropolisPipelines[stage]];
+                [encoder setBuffer:Nodes.Handle offset:0 atIndex:0];
+                [encoder setBuffer:PrimitiveRefs.Handle offset:0 atIndex:1];
+                [encoder setBuffer:Triangles.Handle offset:0 atIndex:2];
+                [encoder setBuffer:Spheres.Handle offset:0 atIndex:3];
+                [encoder setBuffer:Materials.Handle offset:0 atIndex:4];
+                [encoder setBuffer:emitters.Handle offset:0 atIndex:5];
+                [encoder setBytes:&constants length:sizeof(constants) atIndex:6];
+                [encoder setBuffer:Accumulation.Handle offset:0 atIndex:7];
+                [encoder setBuffer:SampleCounts.Handle offset:0 atIndex:8];
+                [encoder setBuffer:statistics.Handle offset:0 atIndex:9];
+                [encoder setBuffer:TextureDescriptors.Handle offset:0 atIndex:10];
+                [encoder setBuffer:TextureTexels.Handle offset:0 atIndex:11];
+                [encoder setBuffer:SampleTargets.Handle offset:0 atIndex:12];
+                BindInstanceBuffers(encoder);
+                [encoder setBuffer:chains.Handle offset:0 atIndex:MetalMlt::ChainBinding];
+                [encoder setBuffer:pass.Handle offset:0 atIndex:MetalMlt::PassBinding];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:MetalMlt::ControlsBinding];
+                [encoder setBuffer:failures.Handle offset:0 atIndex:MetalMlt::ErrorBinding];
+                [encoder setBuffer:bootstrap.Handle offset:0 atIndex:MetalMlt::BootstrapBinding];
+                [encoder setBuffer:normalization.Handle offset:0 atIndex:MetalMlt::DistributionBinding];
+                uint32_t groups = (threads + MetalMlt::ThreadsPerGroup - 1) / MetalMlt::ThreadsPerGroup;
+                [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(MetalMlt::ThreadsPerGroup, 1, 1)];
+                [encoder endEncoding];
+                // Completion publishes shared chain/CDF/film storage to the next
+                // command and retains frame-local resources even during timeout.
+                if (!CommitAndWait(command, "Metal MLT dispatch", cancellation, result.Error) ||
+                    !CheckTraversalError(result.Error))
+                    return false;
+            }
+            const void* status = failures.Handle.contents;
+            const auto* counters = static_cast<const GroupStatistics*>(statistics.Handle.contents);
+            if (!status || (counterRows && !counters))
+            {
+                result.Error = "Metal MLT numerical status or counters are not CPU-visible.";
+                return false;
+            }
+            uint32_t flags;
+            std::memcpy(&flags, status, sizeof(flags));
+            if (flags)
+            {
+                result.Error = "Metal MLT encountered invalid path, chain or film arithmetic.";
+                return false;
+            }
+            for (uint32_t row = 0; row < counterRows; ++row)
+            {
+                result.Statistics.PrimaryRays += counters[row].PrimaryRays.Value();
+                result.Statistics.ShadowRays += counters[row].ShadowRays.Value();
+                result.Statistics.ReflectionRays += counters[row].ReflectionRays.Value();
+                result.Statistics.PrimitiveTests += counters[row].PrimitiveTests.Value();
+            }
+            return true;
+        };
+        if (!dispatch(MetalMlt::ClearStage, pixels))
+            return false;
+        for (uint32_t first = 0; first < options.BootstrapSamples; first += MetalMlt::BootstrapBatch)
+        {
+            controls.First = first;
+            controls.Count = std::min(MetalMlt::BootstrapBatch, options.BootstrapSamples - first);
+            if (!dispatch(MetalMlt::BootstrapStage, controls.Count, controls.Count))
+                return false;
+        }
+        if (!dispatch(MetalMlt::DistributionStage, 1) || !dispatch(MetalMlt::InitializeStage, chainCount))
+            return false;
+        // Crops replay the global chain schedule and keep only local splats.
+        // A complete mutation pass, including untouched pixels, is one film sample.
+        uint32_t steps = fullPixels / chainCount + (fullPixels % chainCount != 0);
+        for (uint32_t sample = 0; sample < constants.TotalSamples; ++sample)
+        {
+            constants.SampleBegin = sample;
+            if (sample && !dispatch(MetalMlt::ClearStage, pixels))
+                return false;
+            for (uint32_t first = 0; first < steps; first += MetalMlt::MutationBatch)
+            {
+                controls.First = first;
+                controls.Count = std::min(MetalMlt::MutationBatch, steps - first);
+                if (!dispatch(MetalMlt::MutateStage, chainCount, chainCount))
+                    return false;
+            }
+            if (!dispatch(MetalMlt::CommitStage, pixels))
+                return false;
+        }
+        return true;
+    }
+
+    bool EnsureProgressivePipelines(std::string& error) const
+    {
+        if (ProgressivePipelines[MetalPpm::ClearStage])
+            return true;
+        @autoreleasepool
+        {
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.fastMathEnabled = NO;
+            if (@available(macOS 11.0, *))
+                options.languageVersion = MTLLanguageVersion2_3;
+            else
+            {
+                ReleaseObject(options);
+                error = "Metal PPM requires macOS 11 or later for its MSL 2.3 arithmetic leaves.";
+                return false;
+            }
+            NSError* detail = nil;
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalPpmSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (!library)
+            {
+                error = ErrorDescription(detail, "Metal PPM compilation failed.");
+                return false;
+            }
+            NSString* names[MetalPpm::StageCount] = {@"ArvoPpmClear", @"ArvoPpmInitialize", @"ArvoPpmCamera",
+                                                     @"ArvoPpmEmit",  @"ArvoPpmIndex",      @"ArvoPpmGather",
+                                                     @"ArvoPpmUpdate"};
+            id<MTLComputePipelineState> compiled[MetalPpm::StageCount] = {};
+            bool complete = true;
+            for (uint32_t stage = 0; stage < MetalPpm::StageCount && complete; ++stage)
+            {
+                id<MTLFunction> function = [library newFunctionWithName:names[stage]];
+                if (function)
+                    compiled[stage] = [Device newComputePipelineStateWithFunction:function error:&detail];
+                ReleaseObject(function);
+                if (!compiled[stage])
+                {
+                    error = ErrorDescription(detail, "Metal PPM pipeline creation failed.");
+                    complete = false;
+                }
+                else if (compiled[stage].maxTotalThreadsPerThreadgroup < MetalPpm::ThreadsPerGroup)
+                {
+                    error = "Metal PPM pipeline does not support its threadgroup size.";
+                    complete = false;
+                }
+            }
+            ReleaseObject(library);
+            if (!complete)
+            {
+                for (auto pipeline : compiled)
+                    ReleaseObject(pipeline);
+                return false;
+            }
+            for (uint32_t stage = 0; stage < MetalPpm::StageCount; ++stage)
+                ProgressivePipelines[stage] = compiled[stage];
+            return true;
+        }
+    }
+    bool RenderProgressivePhotons(const Scene& scene, FrameConstants constants,
+                                  const ProgressivePhotonOptions& options,
+                                  const Detail::CancellationProbe& cancellation, RenderResult& result) const
+    {
+        if (!EnsureProgressivePipelines(result.Error))
+            return false;
+        const auto emission = MetalEmission::PrepareEmitters(scene);
+        for (const auto& source : emission.Sources)
+            if (!(source.Flags & EmitterCastsShadows))
+            {
+                result.Error = "Metal PPM requires shadow casting on every emitter.";
+                return false;
+            }
+        const uint32_t pixelCount = constants.Width * constants.Height;
+        const uint32_t capacity = std::min(options.PathsPerPass, MetalPpm::LightBatch);
+        const uint32_t slotsPerPath = constants.MaxReflectionBounces + 1;
+        uint32_t buckets = 1;
+        while (buckets < capacity)
+            buckets *= 2;
+        const size_t photonBytes = size_t(capacity) * slotsPerPath * MetalPpm::PhotonStride;
+        const size_t visibleBytes = size_t(pixelCount) * MetalPpm::VisibleStride;
+        const size_t pixelBytes = size_t(pixelCount) * MetalPpm::PixelStride;
+        if (std::max({photonBytes, visibleBytes, pixelBytes}) > Device.maxBufferLength)
+        {
+            result.Error =
+                "Metal PPM persistent or batch storage exceeds the device's maximum buffer length.";
+            return false;
+        }
+        Buffer sources, photons, heads, visible, pixels, statistics, errors;
+        constexpr uint32_t CounterRows = std::max(MetalPpm::LightBatch, MetalPpm::PixelBatch);
+        if (!CreateVectorBuffer(sources, emission.Sources, "Arvo Metal PPM emitters", result.Error) ||
+            !CreateBuffer(photons, photonBytes, nullptr, "Arvo Metal PPM photons", result.Error) ||
+            !CreateBuffer(heads, size_t(buckets) * sizeof(uint32_t), nullptr, "Arvo Metal PPM grid",
+                          result.Error) ||
+            !CreateBuffer(visible, visibleBytes, nullptr, "Arvo Metal PPM visible points", result.Error) ||
+            !CreateBuffer(pixels, pixelBytes, nullptr, "Arvo Metal PPM persistent state", result.Error) ||
+            !CreateBuffer(statistics, size_t(CounterRows) * sizeof(GroupStatistics), nullptr,
+                          "Arvo Metal PPM statistics", result.Error) ||
+            !CreateBuffer(errors, sizeof(uint32_t), nullptr, "Arvo Metal PPM error", result.Error))
+            return false;
+        constexpr uint32_t CausticsEnabled = 1, IndirectEnabled = 2;
+        MetalPpm::Controls controls{};
+        controls.Center[0] = emission.Center.X;
+        controls.Center[1] = emission.Center.Y;
+        controls.Center[2] = emission.Center.Z;
+        controls.WorldRadius = emission.Radius;
+        controls.Sources = uint32_t(emission.Sources.size());
+        controls.PathsPerPass = options.PathsPerPass;
+        controls.SlotsPerPath = slotsPerPath;
+        controls.Buckets = buckets;
+        controls.Seed = options.Seed ^ constants.SamplingSeed;
+        controls.Classes =
+            (options.Caustics ? CausticsEnabled : 0) | (options.Indirect ? IndirectEnabled : 0);
+        controls.InitialRadiusScale = options.InitialRadiusScale;
+        controls.Alpha = options.Alpha;
+        const auto dispatch = [&](uint32_t stage, uint32_t first, uint32_t count) {
+            if (cancellation() || !ResetTraversalError(result.Error))
+                return false;
+            controls.First = first;
+            controls.Count = count;
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (!command || !encoder)
+                {
+                    result.Error = "Metal PPM command allocation failed.";
+                    return false;
+                }
+                [encoder setComputePipelineState:ProgressivePipelines[stage]];
+                [encoder setBuffer:Nodes.Handle offset:0 atIndex:0];
+                [encoder setBuffer:PrimitiveRefs.Handle offset:0 atIndex:1];
+                [encoder setBuffer:Triangles.Handle offset:0 atIndex:2];
+                [encoder setBuffer:Spheres.Handle offset:0 atIndex:3];
+                [encoder setBuffer:Materials.Handle offset:0 atIndex:4];
+                [encoder setBuffer:sources.Handle offset:0 atIndex:5];
+                [encoder setBytes:&constants length:sizeof(constants) atIndex:6];
+                [encoder setBuffer:Accumulation.Handle offset:0 atIndex:7];
+                [encoder setBuffer:SampleCounts.Handle offset:0 atIndex:8];
+                [encoder setBuffer:statistics.Handle offset:0 atIndex:9];
+                [encoder setBuffer:TextureDescriptors.Handle offset:0 atIndex:10];
+                [encoder setBuffer:TextureTexels.Handle offset:0 atIndex:11];
+                [encoder setBuffer:SampleTargets.Handle offset:0 atIndex:12];
+                BindInstanceBuffers(encoder);
+                [encoder setBuffer:photons.Handle offset:0 atIndex:MetalPpm::PhotonsBinding];
+                [encoder setBuffer:heads.Handle offset:0 atIndex:MetalPpm::HeadsBinding];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:MetalPpm::ControlsBinding];
+                [encoder setBuffer:errors.Handle offset:0 atIndex:MetalPpm::ErrorBinding];
+                [encoder setBuffer:visible.Handle offset:0 atIndex:MetalPpm::VisibleBinding];
+                [encoder setBuffer:pixels.Handle offset:0 atIndex:MetalPpm::PixelsBinding];
+                const uint32_t groups = (count + MetalPpm::ThreadsPerGroup - 1) / MetalPpm::ThreadsPerGroup;
+                [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(MetalPpm::ThreadsPerGroup, 1, 1)];
+                [encoder endEncoding];
+                // Completed commands publish the hash links and wide state before
+                // buffer reuse. Cancellation also waits for outstanding GPU work.
+                if (!CommitAndWait(command, "Metal PPM dispatch", cancellation, result.Error) ||
+                    !CheckTraversalError(result.Error))
+                    return false;
+            }
+            const auto* failure = static_cast<const uint32_t*>(errors.Handle.contents);
+            if (!failure || *failure)
+            {
+                result.Error = "Metal PPM kernel reported invalid configuration or numerical state.";
+                return false;
+            }
+            if (stage == MetalPpm::CameraStage || stage == MetalPpm::EmitStage ||
+                stage == MetalPpm::GatherStage)
+            {
+                const auto* counters = static_cast<const GroupStatistics*>(statistics.Handle.contents);
+                if (!counters)
+                {
+                    result.Error = "Metal PPM statistics readback is unavailable.";
+                    return false;
+                }
+                for (uint32_t row = 0; row < count; ++row)
+                {
+                    result.Statistics.PrimaryRays += counters[row].PrimaryRays.Value();
+                    result.Statistics.ShadowRays += counters[row].ShadowRays.Value();
+                    result.Statistics.ReflectionRays += counters[row].ReflectionRays.Value();
+                    result.Statistics.PrimitiveTests += counters[row].PrimitiveTests.Value();
+                }
+            }
+            return true;
+        };
+        const auto batch = [&](uint32_t stage, uint32_t total, uint32_t capacity) {
+            for (uint32_t first = 0; first < total; first += capacity)
+                if (!dispatch(stage, first, std::min(capacity, total - first)))
+                    return false;
+            return true;
+        };
+        if (!batch(MetalPpm::ClearStage, buckets, MetalPpm::LinearBatch) ||
+            !batch(MetalPpm::InitializeStage, pixelCount, MetalPpm::LinearBatch))
+            return false;
+        for (controls.Pass = 0; controls.Pass < constants.TotalSamples; ++controls.Pass)
+        {
+            if (!batch(MetalPpm::CameraStage, pixelCount, MetalPpm::PixelBatch))
+                return false;
+            for (uint32_t first = 0; first < options.PathsPerPass; first += capacity)
+            {
+                controls.LightBegin = first;
+                controls.LightCount = std::min(capacity, options.PathsPerPass - first);
+                if (!batch(MetalPpm::ClearStage, buckets, MetalPpm::LinearBatch) ||
+                    !dispatch(MetalPpm::EmitStage, 0, controls.LightCount) ||
+                    !batch(MetalPpm::IndexStage, controls.LightCount * slotsPerPath, MetalPpm::LinearBatch) ||
+                    !batch(MetalPpm::GatherStage, pixelCount, MetalPpm::PixelBatch))
+                    return false;
+            }
+            if (!batch(MetalPpm::UpdateStage, pixelCount, MetalPpm::LinearBatch))
+                return false;
+        }
+        return true;
+    }
+
+    bool EnsurePhotonPipelines(std::string& error) const
+    {
+        if (PhotonPipelines[MetalPhoton::ClearStage])
+            return true;
+        @autoreleasepool
+        {
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            // WideMath uses rounded products and explicit FMA residuals.
+            options.fastMathEnabled = NO;
+            if (@available(macOS 11.0, *))
+                options.languageVersion = MTLLanguageVersion2_3;
+            else
+            {
+                ReleaseObject(options);
+                error = "Metal photon mapping requires macOS 11 or later for its MSL 2.3 arithmetic leaves.";
+                return false;
+            }
+            NSError* detail = nil;
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalPhotonSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (!library)
+            {
+                error = ErrorDescription(detail, "Metal photon compilation failed.");
+                return false;
+            }
+            NSString* entries[MetalPhoton::StageCount] = {@"ArvoPhotonClear", @"ArvoPhotonEmit",
+                                                          @"ArvoPhotonIndex", @"ArvoPhotonCamera"};
+            id<MTLComputePipelineState> compiled[MetalPhoton::StageCount] = {};
+            bool complete = true;
+            for (uint32_t stage = 0; stage < MetalPhoton::StageCount && complete; ++stage)
+            {
+                id<MTLFunction> entry = [library newFunctionWithName:entries[stage]];
+                if (entry)
+                    compiled[stage] = [Device newComputePipelineStateWithFunction:entry error:&detail];
+                ReleaseObject(entry);
+                if (!compiled[stage])
+                {
+                    error = ErrorDescription(detail, "Metal photon pipeline creation failed.");
+                    complete = false;
+                }
+                else if (compiled[stage].maxTotalThreadsPerThreadgroup < MetalPhoton::ThreadsPerGroup)
+                {
+                    error = "Metal photon pipeline does not support its threadgroup size.";
+                    complete = false;
+                }
+            }
+            ReleaseObject(library);
+            if (!complete)
+            {
+                for (auto pipeline : compiled)
+                    ReleaseObject(pipeline);
+                return false;
+            }
+            for (uint32_t stage = 0; stage < MetalPhoton::StageCount; ++stage)
+                PhotonPipelines[stage] = compiled[stage];
+            return true;
+        }
+    }
+    bool RenderPhotons(const Scene& scene, FrameConstants constants, const PhotonMappingOptions& options,
+                       const Detail::CancellationProbe& cancellation, RenderResult& result) const
+    {
+        if (!EnsurePhotonPipelines(result.Error))
+            return false;
+        const auto emission = MetalEmission::PrepareEmitters(scene);
+        for (const auto& source : emission.Sources)
+            if (!(source.Flags & EmitterCastsShadows))
+            {
+                result.Error = "Metal photon mapping requires shadow casting on every emitter.";
+                return false;
+            }
+        uint32_t buckets = 1;
+        while (buckets < options.PhotonPaths)
+            buckets *= 2;
+        const uint32_t pixels = constants.Width * constants.Height,
+                       slotsPerPath = constants.MaxReflectionBounces + 1;
+        const uint32_t slotCount = options.PhotonPaths * slotsPerPath;
+        const size_t recordBytes = size_t(slotCount) * sizeof(MetalPhoton::Photon);
+        if (recordBytes > Device.maxBufferLength)
+        {
+            result.Error = "The requested Metal photon map exceeds this device's maximum buffer length.";
+            return false;
+        }
+        Buffer emitters, records, heads, statistics, failure;
+        if (!CreateVectorBuffer(emitters, emission.Sources, "Arvo Metal photon emitters", result.Error) ||
+            !CreateBuffer(records, recordBytes, nullptr, "Arvo Metal photons", result.Error) ||
+            !CreateBuffer(heads, size_t(buckets) * sizeof(uint32_t), nullptr, "Arvo Metal photon grid",
+                          result.Error) ||
+            !CreateBuffer(statistics, size_t(MetalPhoton::TransportBatch) * sizeof(GroupStatistics), nullptr,
+                          "Arvo Metal photon counters", result.Error) ||
+            !CreateBuffer(failure, sizeof(uint32_t), nullptr, "Arvo Metal photon status", result.Error))
+            return false;
+        constexpr uint32_t CausticsEnabled = 1, IndirectEnabled = 2;
+        MetalPhoton::Controls controls{{emission.Center.X, emission.Center.Y, emission.Center.Z},
+                                       emission.Radius,
+                                       uint32_t(emission.Sources.size()),
+                                       options.PhotonPaths,
+                                       slotsPerPath,
+                                       buckets,
+                                       options.Seed ^ constants.SamplingSeed,
+                                       (options.Caustics ? CausticsEnabled : 0) |
+                                           (options.Indirect ? IndirectEnabled : 0),
+                                       0,
+                                       0,
+                                       options.RadiusScale,
+                                       0,
+                                       {}};
+        auto dispatch = [&](uint32_t stage, uint32_t threads, uint32_t counterRows = 0) {
+            if (cancellation() || !ResetTraversalError(result.Error))
+                return false;
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (!command || !encoder)
+                {
+                    result.Error = "Metal photon command allocation failed.";
+                    return false;
+                }
+                [encoder setComputePipelineState:PhotonPipelines[stage]];
+                [encoder setBuffer:Nodes.Handle offset:0 atIndex:0];
+                [encoder setBuffer:PrimitiveRefs.Handle offset:0 atIndex:1];
+                [encoder setBuffer:Triangles.Handle offset:0 atIndex:2];
+                [encoder setBuffer:Spheres.Handle offset:0 atIndex:3];
+                [encoder setBuffer:Materials.Handle offset:0 atIndex:4];
+                [encoder setBuffer:emitters.Handle offset:0 atIndex:5];
+                [encoder setBytes:&constants length:sizeof(constants) atIndex:6];
+                [encoder setBuffer:Accumulation.Handle offset:0 atIndex:7];
+                [encoder setBuffer:SampleCounts.Handle offset:0 atIndex:8];
+                [encoder setBuffer:statistics.Handle offset:0 atIndex:9];
+                [encoder setBuffer:TextureDescriptors.Handle offset:0 atIndex:10];
+                [encoder setBuffer:TextureTexels.Handle offset:0 atIndex:11];
+                [encoder setBuffer:SampleTargets.Handle offset:0 atIndex:12];
+                BindInstanceBuffers(encoder);
+                [encoder setBuffer:records.Handle offset:0 atIndex:MetalPhoton::RecordsBinding];
+                [encoder setBuffer:heads.Handle offset:0 atIndex:MetalPhoton::HeadsBinding];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:MetalPhoton::ControlsBinding];
+                [encoder setBuffer:failure.Handle offset:0 atIndex:MetalPhoton::ErrorBinding];
+                uint32_t groups = (threads + MetalPhoton::ThreadsPerGroup - 1) / MetalPhoton::ThreadsPerGroup;
+                [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(MetalPhoton::ThreadsPerGroup, 1, 1)];
+                [encoder endEncoding];
+                // Complete each bounded pass before reading shared status, reusing
+                // controls, querying the immutable map or releasing local buffers.
+                if (!CommitAndWait(command, "Metal photon dispatch", cancellation, result.Error) ||
+                    !CheckTraversalError(result.Error))
+                    return false;
+            }
+            const auto* status = static_cast<const uint32_t*>(failure.Handle.contents);
+            const auto* counters = static_cast<const GroupStatistics*>(statistics.Handle.contents);
+            if (!status || (counterRows && !counters))
+            {
+                result.Error = "Metal photon readback is unavailable.";
+                return false;
+            }
+            if (*status)
+            {
+                result.Error = "Metal photon kernel reported invalid configuration or numerical state.";
+                return false;
+            }
+            for (uint32_t row = 0; row < counterRows; ++row)
+            {
+                result.Statistics.PrimaryRays += counters[row].PrimaryRays.Value();
+                result.Statistics.ShadowRays += counters[row].ShadowRays.Value();
+                result.Statistics.ReflectionRays += counters[row].ReflectionRays.Value();
+                result.Statistics.PrimitiveTests += counters[row].PrimitiveTests.Value();
+            }
+            return true;
+        };
+        if (!dispatch(MetalPhoton::ClearStage, buckets))
+            return false;
+        for (uint32_t first = 0; first < options.PhotonPaths; first += MetalPhoton::TransportBatch)
+        {
+            controls.First = first;
+            controls.Count = std::min(MetalPhoton::TransportBatch, options.PhotonPaths - first);
+            if (!dispatch(MetalPhoton::EmitStage, controls.Count, controls.Count))
+                return false;
+        }
+        for (uint32_t first = 0; first < slotCount; first += MetalPhoton::IndexBatch)
+        {
+            controls.First = first;
+            controls.Count = std::min(MetalPhoton::IndexBatch, slotCount - first);
+            if (!dispatch(MetalPhoton::IndexStage, controls.Count))
+                return false;
+        }
+        // Camera tiles share the full-scene emission seed/budget and disk radius.
+        for (controls.Sample = 0; controls.Sample < constants.TotalSamples; ++controls.Sample)
+            for (uint32_t first = 0; first < pixels; first += MetalPhoton::TransportBatch)
+            {
+                controls.First = first;
+                controls.Count = std::min(MetalPhoton::TransportBatch, pixels - first);
+                if (!dispatch(MetalPhoton::CameraStage, controls.Count, controls.Count))
+                    return false;
+            }
+        return true;
+    }
+
+    bool EnsureVcmPipelines(std::string& error) const
+    {
+        if (VcmPipelines[0] != nil)
+            return true;
+        if (@available(macOS 11.0, *))
+        {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.languageVersion = MTLLanguageVersion2_3;
+            options.fastMathEnabled = NO;
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalVcmSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (library == nil)
+            {
+                error = ErrorDescription(detail, "Metal VCM compilation failed.");
+                return false;
+            }
+            id<MTLComputePipelineState> compiled[MetalVcm::StageCount] = {};
+            bool valid = true;
+            for (uint32_t stage = 0; stage < MetalVcm::StageCount && valid; ++stage)
+            {
+                id<MTLFunction> function = [library
+                    newFunctionWithName:[NSString stringWithUTF8String:MetalVcm::EntryPoints[stage]]];
+                if (function != nil)
+                    compiled[stage] = [Device newComputePipelineStateWithFunction:function error:&detail];
+                ReleaseObject(function);
+                if (compiled[stage] == nil ||
+                    compiled[stage].maxTotalThreadsPerThreadgroup < MetalVcm::ThreadsPerGroup)
+                {
+                    valid = false;
+                    error = std::string(MetalVcm::EntryPoints[stage]) + ": " +
+                            ErrorDescription(detail, "Metal VCM pipeline cannot support its threadgroup.");
+                }
+            }
+            ReleaseObject(library);
+            for (uint32_t stage = 0; stage < MetalVcm::StageCount; ++stage)
+                if (valid)
+                    VcmPipelines[stage] = compiled[stage];
+                else
+                    ReleaseObject(compiled[stage]);
+            return valid;
+        }
+        error = "Metal VCM requires macOS 11 or later for MSL 2.3 arithmetic.";
+        return false;
+    }
+
+    bool RenderVcm(const Scene& scene, const FrameConstants& camera, const RenderSettings& settings,
+                   const Detail::CancellationProbe& cancellation, RenderResult& result) const
+    {
+        using namespace MetalVcm;
+        if (cancellation())
+            return false;
+        const auto emission = MetalEmission::PrepareEmitters(scene);
+        if (emission.Sources.size() > std::numeric_limits<uint32_t>::max() ||
+            emission.Sources.size() > Device.maxBufferLength / sizeof(PackedEmitter))
+        {
+            result.Error = "Metal VCM source storage exceeds the device limit.";
+            return false;
+        }
+        for (const auto& source : emission.Sources)
+            if (!(source.Flags & EmitterCastsShadows))
+            {
+                result.Error = "Metal VCM requires shadow casting on every emitter.";
+                return false;
+            }
+        FrameRequest request;
+        auto& c = request.Scene;
+        auto copyVector = [](float(&out)[3], Vec3 value) {
+            out[0] = value.X;
+            out[1] = value.Y;
+            out[2] = value.Z;
+        };
+        copyVector(c.CameraPosition, camera.CameraPosition);
+        copyVector(c.CameraForward, camera.CameraForward);
+        copyVector(c.CameraRight, camera.CameraRight);
+        copyVector(c.CameraUp, camera.CameraUp);
+        copyVector(c.EmissionCenter, ToVec3(emission.Center));
+        c.FullWidth = camera.FullWidth;
+        c.FullHeight = camera.FullHeight;
+        c.TotalSamples = camera.TotalSamples;
+        c.MaxReflections = camera.MaxReflectionBounces;
+        c.HalfWidth = camera.HalfWidth;
+        c.HalfHeight = camera.HalfHeight;
+        c.LensRadius = camera.LensRadius;
+        c.FocusDistance = camera.FocusDistance;
+        c.MaterialCount = MaterialCount;
+        c.NodeCount = NodeCount;
+        c.TriangleCount = TriangleCount;
+        c.Acceleration = camera.Acceleration;
+        c.InstanceNodeCount = InstanceNodeCount;
+        c.TextureCount = TextureCount;
+        c.TexelCount = TextureTexelCount;
+        c.TransportFlags = camera.TransportFlags;
+        c.EmissionRadius = emission.Radius;
+        c.SourceCount = uint32_t(emission.Sources.size());
+        c.Sequence = camera.SamplingSequence;
+        c.SamplingSeed = camera.SamplingSeed;
+        request.TileX = camera.TileX;
+        request.TileY = camera.TileY;
+        request.Width = camera.Width;
+        request.Height = camera.Height;
+        request.Options = settings.Vcm;
+        request.Mis = settings.Transport.Mis;
+        request.NextEventEstimation = settings.Transport.NextEventEstimation;
+        request.MaximumBufferBytes = Device.maxBufferLength;
+        FramePlan plan;
+        if (!PrepareFrame(request, plan, result.Error) || !EnsureVcmPipelines(result.Error) || cancellation())
+            return false;
+        std::array<Buffer, StorageCount> storage;
+        Buffer sources;
+        if (!CreateVectorBuffer(sources, emission.Sources, "Arvo Metal VCM sources", result.Error))
+            return false;
+        const char* labels[StorageCount] = {
+            "Arvo Metal VCM vertices", "Arvo Metal VCM paths",       "Arvo Metal VCM statistics",
+            "Arvo Metal VCM index",    "Arvo Metal VCM pixel state", "Arvo Metal VCM splats",
+            "Arvo Metal VCM film",     "Arvo Metal VCM pending",     "Arvo Metal VCM errors"};
+        for (uint32_t i = 0; i < StorageCount; ++i)
+        {
+            if (cancellation() || !CreateBuffer(storage[i], plan.Bytes[i], nullptr, labels[i], result.Error))
+                return false;
+            if (!storage[i].Handle.contents)
+            {
+                result.Error = "Metal VCM storage is not CPU-visible.";
+                return false;
+            }
+        }
+        auto buffer = [&](Storage slot) { return storage[uint32_t(slot)].Handle; };
+        auto* failure = static_cast<uint32_t*>(buffer(Storage::Errors).contents);
+        auto* pending = static_cast<uint32_t*>(buffer(Storage::Pending).contents);
+        *failure = *pending = 0;
+        FrameCallbacks callbacks;
+        callbacks.Cancelled = cancellation;
+        callbacks.Execute = [&](const MetalVcm::Dispatch& dispatch, uint32_t& continuation,
+                                std::string& error) {
+            @autoreleasepool
+            {
+                *pending = 0;
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                // Default command buffers retain bound resources through completion,
+                // including a terminal timeout. Never use unretained references here.
+                // https://developer.apple.com/documentation/metal/mtlcommandbuffer/retainedreferences
+                if (command == nil || !command.retainedReferences)
+                {
+                    error = "Metal VCM requires a retaining command buffer.";
+                    return false;
+                }
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (encoder == nil)
+                {
+                    error = "Metal VCM command encoder allocation failed.";
+                    return false;
+                }
+                [encoder setComputePipelineState:VcmPipelines[uint32_t(dispatch.Kernel)]];
+                [encoder setBuffer:Nodes.Handle offset:0 atIndex:NodesBinding];
+                [encoder setBuffer:PrimitiveRefs.Handle offset:0 atIndex:ReferencesBinding];
+                [encoder setBuffer:Triangles.Handle offset:0 atIndex:TrianglesBinding];
+                [encoder setBuffer:Spheres.Handle offset:0 atIndex:SpheresBinding];
+                [encoder setBuffer:Materials.Handle offset:0 atIndex:MaterialsBinding];
+                [encoder setBuffer:sources.Handle offset:0 atIndex:SourcesBinding];
+                [encoder setBytes:&plan.Scene length:sizeof(plan.Scene) atIndex:SceneBinding];
+                [encoder setBuffer:TextureDescriptors.Handle offset:0 atIndex:TexturesBinding];
+                [encoder setBuffer:TextureTexels.Handle offset:0 atIndex:TexelsBinding];
+                [encoder setBuffer:InstanceRecords.Handle offset:0 atIndex:InstancesBinding];
+                [encoder setBuffer:InstanceNodes.Handle offset:0 atIndex:MetalVcm::InstanceNodesBinding];
+                [encoder setBuffer:buffer(Storage::Errors) offset:0 atIndex:ErrorsBinding];
+                if (dispatch.Kernel == Stage::LightWalks || dispatch.Kernel == Stage::CameraWalks)
+                    [encoder setBytes:&dispatch.Walks length:sizeof(dispatch.Walks) atIndex:ControlsBinding];
+                else
+                    [encoder setBytes:&dispatch.Coupling
+                               length:sizeof(dispatch.Coupling)
+                              atIndex:ControlsBinding];
+                [encoder setBuffer:buffer(Storage::Vertices) offset:0 atIndex:VerticesBinding];
+                [encoder setBuffer:buffer(Storage::Paths) offset:0 atIndex:PathsBinding];
+                [encoder setBuffer:buffer(Storage::Statistics) offset:0 atIndex:StatisticsBinding];
+                [encoder setBytes:&dispatch.Frame length:sizeof(dispatch.Frame) atIndex:FrameBinding];
+                [encoder setBuffer:buffer(Storage::Index) offset:0 atIndex:IndexBinding];
+                [encoder setBuffer:buffer(Storage::Pixels) offset:0 atIndex:PixelsBinding];
+                [encoder setBuffer:buffer(Storage::Splats) offset:0 atIndex:SplatsBinding];
+                [encoder setBuffer:buffer(Storage::Film) offset:0 atIndex:FilmBinding];
+                [encoder setBuffer:buffer(Storage::Pending) offset:0 atIndex:PendingBinding];
+                uint32_t groups =
+                    (dispatch.Lanes + MetalVcm::ThreadsPerGroup - 1) / MetalVcm::ThreadsPerGroup;
+                [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(MetalVcm::ThreadsPerGroup, 1, 1)];
+                [encoder endEncoding];
+                if (!CommitAndWait(command, MetalVcm::EntryPoints[uint32_t(dispatch.Kernel)], cancellation,
+                                   error))
+                    return false;
+                if (*failure)
+                {
+                    error = "Metal VCM kernel error bits: " + std::to_string(*failure);
+                    return false;
+                }
+                continuation = *pending;
+                const auto* counters =
+                    static_cast<const WalkStatistics*>(buffer(Storage::Statistics).contents);
+                auto counter = [](const uint32_t(&parts)[2]) {
+                    return uint64_t(parts[0]) | (uint64_t(parts[1]) << 32);
+                };
+                for (uint32_t lane = 0; lane < dispatch.StatisticsRows; ++lane)
+                {
+                    result.Statistics.PrimaryRays += counter(counters[lane].Camera);
+                    result.Statistics.ReflectionRays += counter(counters[lane].Transport);
+                    result.Statistics.PrimitiveTests += counter(counters[lane].Tests);
+                    result.Statistics.ShadowRays += counter(counters[lane].Shadow);
+                }
+                return true;
+            }
+        };
+        const auto* film = static_cast<const MetalVcm::FilmPixel*>(buffer(Storage::Film).contents);
+        callbacks.Publish = [&](uint32_t completed, std::string& error) {
+            for (uint32_t pixel = 0; pixel < plan.Frame.PixelCapacity; ++pixel)
+            {
+                if (pixel % LinearBatch == 0 && cancellation())
+                    return false;
+                if (film[pixel].Samples != completed)
+                {
+                    error = "Metal VCM did not commit a complete pass.";
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!ExecuteFrame(plan, callbacks, result.Error))
+            return false;
+        result.Film = LinearFilm(settings.Width, settings.Height);
+        result.Output = Image(settings.Width, settings.Height);
+        auto& rgba = result.Output.GetPixelsRGBA8();
+        constexpr size_t Channels = 4;
+        constexpr uint8_t Opaque = 255;
+        for (uint32_t pixel = 0; pixel < plan.Frame.PixelCapacity; ++pixel)
+        {
+            if (pixel % LinearBatch == 0 && cancellation())
+                return false;
+            Float3 mean(film[pixel].Mean[0], film[pixel].Mean[1], film[pixel].Mean[2]);
+            if (!IsFinite(mean) || !IsNonNegative(mean))
+            {
+                result.Error = "Metal VCM final film is not finite and nonnegative.";
+                return false;
+            }
+            result.Film.Pixels[pixel] = {mean, 0, film[pixel].Samples};
+            for (size_t channel = 0; channel < Channels - 1; ++channel)
+                rgba[size_t(pixel) * Channels + channel] =
+                    settings.GammaCorrection ? Maths::LinearToSRGB8(film[pixel].Mean[channel])
+                                             : Maths::LinearToUNorm8(film[pixel].Mean[channel]);
+            rgba[size_t(pixel) * Channels + Channels - 1] = Opaque;
+            ++result.Statistics.CompletedPixels;
+        }
+        return !cancellation();
+    }
+
+    bool MicropolygonPassNative(MicropolygonData::Controls controls,
+                                const std::vector<MicropolygonData::Patch>& patches,
+                                const std::vector<MicropolygonData::Range>& ranges,
+                                std::vector<uint32_t>& words, const Detail::CancellationProbe& cancelled,
+                                std::string& error) const
+    {
+        namespace M = MicropolygonData;
+        constexpr uint32_t Threads = 64;
+        if (DicingPipeline == nil)
+        {
+            if (@available(macOS 11.0, *))
+            {
+                NSError* detail = nil;
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                options.languageVersion = MTLLanguageVersion2_3;
+                options.fastMathEnabled = NO;
+                id<MTLLibrary> library = [Device
+                    newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalMicropolygonSource]
+                                 options:options
+                                   error:&detail];
+                ReleaseObject(options);
+                if (library == nil)
+                {
+                    error = ErrorDescription(detail, "Metal dicing compilation failed");
+                    return false;
+                }
+                id<MTLFunction> function = [library newFunctionWithName:@"ArvoDiceMicropolygons"];
+                id<MTLComputePipelineState> pipeline =
+                    function == nil ? nil
+                                    : [Device newComputePipelineStateWithFunction:function error:&detail];
+                ReleaseObject(function);
+                ReleaseObject(library);
+                if (pipeline == nil || pipeline.maxTotalThreadsPerThreadgroup < Threads)
+                {
+                    ReleaseObject(pipeline);
+                    error = ErrorDescription(detail, "Metal dicing pipeline is unavailable");
+                    return false;
+                }
+                DicingPipeline = pipeline;
+            }
+            else
+            {
+                error = "Metal micropolygons require macOS 11 or later";
+                return false;
+            }
+        }
+        const M::Range empty{};
+        const void* sources[]{patches.data(), ranges.empty() ? &empty : ranges.data(), nullptr};
+        const size_t sizes[]{patches.size() * sizeof(M::Patch),
+                             std::max(size_t(1), ranges.size()) * sizeof(M::Range),
+                             words.size() * sizeof(uint32_t)};
+        constexpr uint32_t BufferCount = 3, Output = 2;
+        Buffer buffers[BufferCount];
+        for (uint32_t i = 0; i < BufferCount; ++i)
+        {
+            if (sizes[i] > Device.maxBufferLength)
+            {
+                error = "Metal micropolygon buffer exceeds device limits";
+                return false;
+            }
+            if (cancelled() || !CreateBuffer(buffers[i], sizes[i], sources[i], "Arvo micropolygons", error))
+                return false;
+        }
+        if (!buffers[Output].Handle.contents)
+        {
+            error = "Metal dicing output is not CPU-visible";
+            return false;
+        }
+        std::memset(buffers[Output].Handle.contents, 0, sizes[Output]);
+        constexpr uint32_t BatchItems = 16384;
+        const uint32_t population = controls.Dispatch.Y;
+        for (controls.Dispatch.X = 0; controls.Dispatch.X < population; controls.Dispatch.X += BatchItems)
+        {
+            if (cancelled())
+                return false;
+            controls.Dispatch.Y = std::min(BatchItems, population - controls.Dispatch.X);
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (command == nil || encoder == nil)
+                {
+                    error = "Metal dicing command allocation failed";
+                    return false;
+                }
+                [encoder setComputePipelineState:DicingPipeline];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:0];
+                for (NSUInteger i = 0; i < BufferCount; ++i)
+                    [encoder setBuffer:buffers[i].Handle offset:0 atIndex:i + 1];
+                [encoder dispatchThreadgroups:MTLSizeMake((controls.Dispatch.Y + Threads - 1) / Threads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(Threads, 1, 1)];
+                [encoder endEncoding];
+                if (!CommitAndWait(command, "Metal micropolygon generation", cancelled, error))
+                    return false;
+            }
+        }
+        std::memcpy(words.data(), buffers[Output].Handle.contents, sizes[Output]);
+        return !cancelled();
+    }
+
+    bool EnsureTemporalPipeline(std::string& error) const
+    {
+        if (TemporalDenoisePipeline != nil)
+            return true;
+        if (@available(macOS 11.0, *))
+        {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.languageVersion = MTLLanguageVersion2_3;
+            options.fastMathEnabled = NO;
+            id<MTLLibrary> library = [Device
+                newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalTemporalDenoiseSource]
+                             options:options
+                               error:&detail];
+            ReleaseObject(options);
+            if (library == nil)
+            {
+                error = ErrorDescription(detail, "Metal temporal compilation failed");
+                return false;
+            }
+            id<MTLFunction> function = [library newFunctionWithName:@"ArvoTemporalDenoise"];
+            id<MTLComputePipelineState> pipeline =
+                function == nil ? nil : [Device newComputePipelineStateWithFunction:function error:&detail];
+            ReleaseObject(function);
+            ReleaseObject(library);
+            constexpr uint32_t Threads = 64;
+            if (pipeline == nil || pipeline.maxTotalThreadsPerThreadgroup < Threads)
+            {
+                ReleaseObject(pipeline);
+                error = ErrorDescription(detail, "Metal temporal pipeline is unavailable");
+                return false;
+            }
+            TemporalDenoisePipeline = pipeline;
+            return true;
+        }
+        error = "Metal temporal reconstruction requires macOS 11 or later";
+        return false;
+    }
+    bool ReconstructTemporalNative(TemporalData::Controls controls, const std::vector<TemporalPixel>& current,
+                                   const std::vector<GeometryGuide>& guides,
+                                   const std::vector<TemporalPixel>& previous,
+                                   const std::vector<GeometryGuide>& oldGuides,
+                                   const Detail::CancellationProbe& cancelled,
+                                   std::vector<TemporalPixel>& result, Image& display,
+                                   std::string& error) const
+    {
+        if (!EnsureTemporalPipeline(error))
+            return false;
+        const TemporalPixel emptyColor{};
+        const GeometryGuide emptyGuide{};
+        constexpr uint32_t InputCount = 4, OutputCount = 3, ColorOutput = 0, DisplayOutput = 1,
+                           ErrorOutput = 2;
+        constexpr NSUInteger OutputBinding = InputCount, ControlsBinding = InputCount + OutputCount;
+        const size_t count = size_t(controls.Width) * controls.Height,
+                     colorBytes = count * sizeof(TemporalPixel), displayBytes = count * sizeof(uint32_t);
+        const void* sources[] = {current.data(), guides.data(),
+                                 previous.empty() ? &emptyColor : previous.data(),
+                                 oldGuides.empty() ? &emptyGuide : oldGuides.data()};
+        const size_t inputBytes[] = {
+            current.size() * sizeof(current[0]), guides.size() * sizeof(guides[0]),
+            previous.empty() ? sizeof(emptyColor) : previous.size() * sizeof(previous[0]),
+            oldGuides.empty() ? sizeof(emptyGuide) : oldGuides.size() * sizeof(oldGuides[0])};
+        const size_t outputBytes[] = {colorBytes, displayBytes, sizeof(uint32_t)};
+        for (auto bytes : inputBytes)
+            if (bytes > Device.maxBufferLength)
+            {
+                error = "Metal temporal input exceeds buffer limit";
+                return false;
+            }
+        for (auto bytes : outputBytes)
+            if (bytes > Device.maxBufferLength)
+            {
+                error = "Metal temporal output exceeds buffer limit";
+                return false;
+            }
+        Buffer inputs[InputCount], outputs[OutputCount];
+        for (uint32_t i = 0; i < InputCount; ++i)
+            if (!CreateBuffer(inputs[i], inputBytes[i], sources[i], "Arvo temporal input", error))
+                return false;
+        for (uint32_t i = 0; i < OutputCount; ++i)
+        {
+            if (!CreateBuffer(outputs[i], outputBytes[i], nullptr, "Arvo temporal output", error))
+                return false;
+            if (!outputs[i].Handle.contents)
+            {
+                error = "Metal temporal output is not CPU-visible";
+                return false;
+            }
+        }
+        std::memset(outputs[ErrorOutput].Handle.contents, 0, sizeof(uint32_t));
+        constexpr uint32_t Batch = 16384, Threads = 64;
+        for (controls.Begin = 0; controls.Begin < count; controls.Begin += Batch)
+        {
+            if (cancelled())
+                return false;
+            controls.Count = std::min(Batch, uint32_t(count) - controls.Begin);
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (command == nil || encoder == nil)
+                {
+                    error = "Metal temporal command allocation failed";
+                    return false;
+                }
+                [encoder setComputePipelineState:TemporalDenoisePipeline];
+                for (NSUInteger i = 0; i < InputCount; ++i)
+                    [encoder setBuffer:inputs[i].Handle offset:0 atIndex:i];
+                for (NSUInteger i = 0; i < OutputCount; ++i)
+                    [encoder setBuffer:outputs[i].Handle offset:0 atIndex:OutputBinding + i];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:ControlsBinding];
+                [encoder dispatchThreadgroups:MTLSizeMake((controls.Count + Threads - 1) / Threads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(Threads, 1, 1)];
+                [encoder endEncoding];
+                if (!CommitAndWait(command, "Metal temporal reconstruction", cancelled, error))
+                    return false;
+            }
+            uint32_t failure = 0;
+            std::memcpy(&failure, outputs[ErrorOutput].Handle.contents, sizeof(failure));
+            if (failure)
+            {
+                error = "Metal temporal reconstruction reported invalid configuration or radiance";
+                return false;
+            }
+        }
+        std::vector<TemporalPixel> filtered(count);
+        Image encoded(controls.Width, controls.Height);
+        std::memcpy(filtered.data(), outputs[ColorOutput].Handle.contents, colorBytes);
+        std::memcpy(encoded.GetPixelsRGBA8().data(), outputs[DisplayOutput].Handle.contents, displayBytes);
+        if (cancelled())
+            return false;
+        result = std::move(filtered);
+        display = std::move(encoded);
+        return true;
+    }
+
+    bool EnsureGeometryGuidePipelines(std::string& error) const
+    {
+        if (GeometryGuidePipelines[0] != nil && GeometryGuidePipelines[1] != nil)
+            return true;
+        if (@available(macOS 11.0, *))
+        {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.languageVersion = MTLLanguageVersion2_3;
+            options.fastMathEnabled = NO;
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalGeometryGuidesSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (library == nil)
+            {
+                error = ErrorDescription(detail, "Metal geometry guide compilation failed");
+                return false;
+            }
+            const std::array<NSString*, 2> names{@"ArvoGenerateGeometryGuideRays",
+                                                 @"ArvoResolveGeometryGuideHits"};
+            id<MTLComputePipelineState> compiled[2]{};
+            constexpr uint32_t Threads = 64;
+            bool success = true;
+            for (size_t stage = 0; stage < names.size(); ++stage)
+            {
+                id<MTLFunction> function = [library newFunctionWithName:names[stage]];
+                if (function != nil)
+                    compiled[stage] = [Device newComputePipelineStateWithFunction:function error:&detail];
+                ReleaseObject(function);
+                if (compiled[stage] == nil || compiled[stage].maxTotalThreadsPerThreadgroup < Threads)
+                {
+                    success = false;
+                    break;
+                }
+            }
+            ReleaseObject(library);
+            if (!success)
+            {
+                for (auto pipeline : compiled)
+                    ReleaseObject(pipeline);
+                error = ErrorDescription(detail, "Metal geometry guide pipeline creation failed");
+                return false;
+            }
+            for (size_t stage = 0; stage < names.size(); ++stage)
+                GeometryGuidePipelines[stage] = compiled[stage];
+            return true;
+        }
+        error = "Metal geometry guides require macOS 11 or later";
+        return false;
+    }
+
+    template <class Output>
+    bool GeometryGuideStage(GeometryGuideData::Controls controls,
+                            const std::vector<GeometryGuideData::EncodedRay>& rays,
+                            const std::vector<RayQueryHit>& hits, const Detail::CancellationProbe& cancelled,
+                            std::vector<Output>& result, std::string& error) const
+    {
+        constexpr bool Generate = std::is_same<Output, GeometryGuideData::EncodedRay>::value;
+        if (!EnsureGeometryGuidePipelines(error))
+            return false;
+        const size_t count = size_t(controls.Width) * controls.Height, bytes = count * sizeof(Output);
+        if (bytes > Device.maxBufferLength || rays.size() * sizeof(rays[0]) > Device.maxBufferLength ||
+            hits.size() * sizeof(hits[0]) > Device.maxBufferLength)
+        {
+            error = "Metal geometry guides exceed the device buffer limit";
+            return false;
+        }
+        Buffer rayInput, hitInput, output, errors;
+        if constexpr (!Generate)
+        {
+            if (rays.size() != count || hits.size() != count)
+            {
+                error = "Metal geometry guide input extent mismatch";
+                return false;
+            }
+            if (!CreateVectorBuffer(rayInput, rays, "Arvo geometry guide rays", error) ||
+                !CreateVectorBuffer(hitInput, hits, "Arvo geometry guide hits", error))
+                return false;
+        }
+        if (!CreateBuffer(output, bytes, nullptr, "Arvo geometry guide output", error) ||
+            !CreateBuffer(errors, sizeof(uint32_t), nullptr, "Arvo geometry guide errors", error))
+            return false;
+        if (!errors.Handle.contents || !output.Handle.contents)
+        {
+            error = "Metal geometry guide buffers are not CPU-visible";
+            return false;
+        }
+        std::memset(errors.Handle.contents, 0, sizeof(uint32_t));
+        constexpr uint32_t Batch = 16384, Threads = 64;
+        for (controls.Begin = 0; controls.Begin < count; controls.Begin += Batch)
+        {
+            if (cancelled())
+                return false;
+            controls.Count = std::min(Batch, uint32_t(count) - controls.Begin);
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (command == nil || encoder == nil)
+                {
+                    error = "Metal geometry guide command allocation failed";
+                    return false;
+                }
+                [encoder setComputePipelineState:GeometryGuidePipelines[Generate ? 0 : 1]];
+                if constexpr (Generate)
+                {
+                    [encoder setBuffer:output.Handle offset:0 atIndex:0];
+                    [encoder setBuffer:errors.Handle offset:0 atIndex:1];
+                    [encoder setBytes:&controls length:sizeof(controls) atIndex:2];
+                }
+                else
+                {
+                    [encoder setBuffer:rayInput.Handle offset:0 atIndex:0];
+                    [encoder setBuffer:hitInput.Handle offset:0 atIndex:1];
+                    [encoder setBuffer:output.Handle offset:0 atIndex:2];
+                    [encoder setBuffer:errors.Handle offset:0 atIndex:3];
+                    [encoder setBytes:&controls length:sizeof(controls) atIndex:4];
+                }
+                [encoder dispatchThreadgroups:MTLSizeMake((controls.Count + Threads - 1) / Threads, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(Threads, 1, 1)];
+                [encoder endEncoding];
+                if (!CommitAndWait(command, "Metal geometry guides", cancelled, error))
+                    return false;
+            }
+            uint32_t failure = 0;
+            std::memcpy(&failure, errors.Handle.contents, sizeof(failure));
+            if (failure)
+            {
+                error = "Metal geometry guide generation or resolve failed";
+                return false;
+            }
+        }
+        if (cancelled())
+            return false;
+        std::vector<Output> decoded(count);
+        std::memcpy(decoded.data(), output.Handle.contents, bytes);
+        result = std::move(decoded);
+        return true;
+    }
+
+    bool EnsureSpatialDenoisePipeline(std::string& error) const
+    {
+        if (SpatialDenoisePipeline != nil)
+            return true;
+        if (@available(macOS 11.0, *))
+        {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.languageVersion = MTLLanguageVersion2_3;
+            options.fastMathEnabled = NO;
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalSpatialDenoiseSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (library == nil)
+            {
+                error = ErrorDescription(detail, "Metal spatial denoising compilation failed.");
+                return false;
+            }
+            id<MTLFunction> function = [library newFunctionWithName:@"ArvoSpatialDenoise"];
+            id<MTLComputePipelineState> pipeline =
+                function == nil ? nil : [Device newComputePipelineStateWithFunction:function error:&detail];
+            ReleaseObject(function);
+            ReleaseObject(library);
+            constexpr uint32_t Threads = 64;
+            if (pipeline == nil || pipeline.maxTotalThreadsPerThreadgroup < Threads)
+            {
+                error = ErrorDescription(detail, "Metal spatial denoising pipeline is unavailable.");
+                ReleaseObject(pipeline);
+                return false;
+            }
+            SpatialDenoisePipeline = pipeline;
+            return true;
+        }
+        error = "Metal spatial denoising requires macOS 11 or later.";
+        return false;
+    }
+
+    bool AllocateDenoisedNative(const std::vector<AdaptiveReconstructionData::Pixel>& input,
+        AdaptiveReconstructionData::Controls controls, const Detail::CancellationProbe& cancellation,
+        std::vector<uint32_t>& result, std::string& error) const
+    {
+        constexpr uint32_t Threads = 64, Batch = 16384;
+        if (AdaptiveDenoisePipeline == nil)
+        {
+            if (@available(macOS 11.0, *))
+            {
+                NSError* detail = nil;
+                MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+                options.languageVersion = MTLLanguageVersion2_3;
+                options.fastMathEnabled = NO;
+                id<MTLLibrary> library = [Device newLibraryWithSource:
+                    [NSString stringWithUTF8String:Detail::MetalAdaptiveDenoiseSource] options:options error:&detail];
+                ReleaseObject(options);
+                if (library == nil) { error = ErrorDescription(detail, "Metal adaptive allocation compilation failed."); return false; }
+                id<MTLFunction> function = [library newFunctionWithName:@"ArvoAdaptiveDenoise"];
+                id<MTLComputePipelineState> pipeline = function == nil ? nil :
+                    [Device newComputePipelineStateWithFunction:function error:&detail];
+                ReleaseObject(function); ReleaseObject(library);
+                if (pipeline == nil || pipeline.maxTotalThreadsPerThreadgroup < Threads)
+                {
+                    error = ErrorDescription(detail, "Metal adaptive allocation pipeline is unavailable.");
+                    ReleaseObject(pipeline); return false;
+                }
+                AdaptiveDenoisePipeline = pipeline;
+            }
+            else { error = "Metal adaptive allocation requires macOS 11 or later."; return false; }
+        }
+        const size_t inputBytes = input.size() * sizeof(input.front()), bytes = input.size() * sizeof(uint32_t);
+        if (std::max(inputBytes, bytes) > Device.maxBufferLength)
+        { error = "Metal adaptive allocation exceeds the device buffer limit."; return false; }
+        Buffer raw, counts;
+        if (!CreateVectorBuffer(raw, input, "Arvo Metal allocation pilots", error) ||
+            !CreateBuffer(counts, bytes, nullptr, "Arvo Metal production budgets", error)) return false;
+        const auto pixels = uint32_t(input.size());
+        for (controls.Begin = 0; controls.Begin < pixels; controls.Begin += Batch)
+        {
+            if (cancellation()) return false;
+            controls.Count = std::min(Batch, pixels - controls.Begin);
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (command == nil || encoder == nil) { error = "Metal allocation command creation failed."; return false; }
+                [encoder setComputePipelineState:AdaptiveDenoisePipeline];
+                [encoder setBuffer:raw.Handle offset:0 atIndex:0];
+                [encoder setBuffer:counts.Handle offset:0 atIndex:1];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:2];
+                [encoder dispatchThreadgroups:MTLSizeMake((controls.Count + Threads - 1) / Threads, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(Threads, 1, 1)];
+                [encoder endEncoding];
+                if (!CommitAndWait(command, "Metal adaptive allocation", cancellation, error)) return false;
+            }
+        }
+        if (cancellation()) return false;
+        const auto* data = static_cast<const uint32_t*>(counts.Handle.contents);
+        if (!data) { error = "Metal production budgets are not CPU-visible."; return false; }
+        result.assign(data, data + pixels);
+        return true;
+    }
+
+    GeometryGuideResult CaptureGuidesNative(const Scene &scene, const Camera &camera,
+                                            const RenderSettings &settings,
+                                            const Detail::CancellationProbe &stopped) const
+    {
+        return Detail::CaptureGeometryGuides(
+            scene, camera, settings, stopped, [&](const auto &controls, auto &rays, auto &error)
+            { return GeometryGuideStage(controls, {}, {}, stopped, rays, error); }, [&](const auto &rays)
+            { return QueryNative(scene, rays, {settings.Acceleration, settings.BvhPolicy}, stopped); },
+            [&](const auto &controls, const auto &rays, const auto &hits, auto &guides, auto &error)
+            { return GeometryGuideStage(controls, rays, hits, stopped, guides, error); });
+    }
+
+    bool ReconstructNative(const LinearFilm &film, const RenderSettings &settings,
+                           const GeometryGuideImage *guides, const Detail::CancellationProbe &cancellation,
+                           ReconstructedImage &result, std::string &error) const
+    {
+        namespace Data = ReconstructionData;
+        if (!ValidateReconstructionInput(film, settings.Reconstruction, error) ||
+            !ValidateReconstructionGuides(film, settings.Reconstruction, guides, error) ||
+            !EnsureSpatialDenoisePipeline(error))
+            return false;
+        const size_t inputBytes = film.Pixels.size() * sizeof(Data::Pixel);
+        const size_t colorBytes = film.Pixels.size() * sizeof(Vec4);
+        const size_t displayBytes = film.Pixels.size() * sizeof(uint32_t);
+        if (std::max({inputBytes, colorBytes, displayBytes}) > Device.maxBufferLength)
+        {
+            error = "Metal reconstruction film exceeds the device's maximum buffer length.";
+            return false;
+        }
+        std::vector<Data::Pixel> input;
+        input.reserve(film.Pixels.size());
+        for (const auto& pixel : film.Pixels)
+        {
+            if (cancellation())
+                return false;
+            input.push_back({pixel.MeanRadiance.X, pixel.MeanRadiance.Y, pixel.MeanRadiance.Z,
+                             pixel.LuminanceM2, pixel.SampleCount});
+            if (guides)
+                Data::PackGuide(input.back(), guides->Pixels[input.size() - 1]);
+        }
+        Buffer raw, previous, next, display, failures;
+        if (!CreateVectorBuffer(raw, input, "Arvo Metal reconstruction raw film", error) ||
+            !CreateBuffer(previous, colorBytes, nullptr, "Arvo Metal reconstruction previous", error) ||
+            !CreateBuffer(next, colorBytes, nullptr, "Arvo Metal reconstruction next", error) ||
+            !CreateBuffer(display, displayBytes, nullptr, "Arvo Metal reconstruction display", error) ||
+            !CreateBuffer(failures, sizeof(uint32_t), nullptr, "Arvo Metal reconstruction status", error))
+            return false;
+        if (!failures.Handle.contents)
+        {
+            error = "Metal reconstruction status is not CPU-visible.";
+            return false;
+        }
+        std::memset(failures.Handle.contents, 0, sizeof(uint32_t));
+        const auto& options = settings.Reconstruction;
+        Data::Controls controls{film.Width,
+                                film.Height,
+                                0,
+                                0,
+                                0,
+                                ReconstructionUsesMoments(settings.Integrator) ? Data::MomentGuidance : 0,
+                                options.NoiseScale,
+                                options.RelativeColorScale,
+                                options.AbsoluteColorScale,
+                                settings.GammaCorrection ? 1u : 0u,
+                                options.NormalScale,
+                                options.RelativePlaneScale};
+        if (guides)
+            controls.Flags |= Data::GeometryGuidance;
+        constexpr uint32_t Threads = 64, Batch = 16384;
+        const uint32_t pixels = uint32_t(film.Pixels.size());
+        for (controls.Pass = 0; controls.Pass < options.Passes; ++controls.Pass)
+        {
+            for (controls.Begin = 0; controls.Begin < pixels; controls.Begin += Batch)
+            {
+                if (cancellation())
+                    return false;
+                controls.Count = std::min(Batch, pixels - controls.Begin);
+                @autoreleasepool
+                {
+                    id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                    if (command == nil || encoder == nil)
+                    {
+                        error = "Metal reconstruction command allocation failed.";
+                        return false;
+                    }
+                    [encoder setComputePipelineState:SpatialDenoisePipeline];
+                    [encoder setBuffer:raw.Handle offset:0 atIndex:0];
+                    [encoder setBuffer:previous.Handle offset:0 atIndex:1];
+                    [encoder setBuffer:next.Handle offset:0 atIndex:2];
+                    [encoder setBuffer:failures.Handle offset:0 atIndex:3];
+                    [encoder setBytes:&controls length:sizeof(controls) atIndex:4];
+                    [encoder setBuffer:display.Handle offset:0 atIndex:5];
+                    [encoder dispatchThreadgroups:MTLSizeMake((controls.Count + Threads - 1) / Threads, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(Threads, 1, 1)];
+                    [encoder endEncoding];
+                    if (!CommitAndWait(command, "Metal spatial denoising", cancellation, error))
+                        return false;
+                }
+                uint32_t failure = 0;
+                std::memcpy(&failure, failures.Handle.contents, sizeof(failure));
+                if (failure)
+                {
+                    error = "Metal spatial denoising reported invalid state.";
+                    return false;
+                }
+            }
+            std::swap(previous, next);
+        }
+        const auto* colors = static_cast<const Vec4*>(previous.Handle.contents);
+        const auto* rgba = static_cast<const uint8_t*>(display.Handle.contents);
+        if (!colors || !rgba)
+        {
+            error = "Metal reconstructed image is not CPU-visible.";
+            return false;
+        }
+        ReconstructedImage output{film.Width, film.Height, {}, Image(film.Width, film.Height)};
+        output.Pixels.reserve(pixels);
+        for (uint32_t row = 0; row < film.Height; ++row)
+        {
+            if (cancellation())
+                return false;
+            const size_t first = size_t(row) * film.Width;
+            for (uint32_t column = 0; column < film.Width; ++column)
+            {
+                const Vec4 pixel = colors[first + column];
+                output.Pixels.push_back({pixel.X, pixel.Y, pixel.Z});
+            }
+            std::memcpy(output.Display.GetPixelsRGBA8().data() + first * sizeof(uint32_t),
+                        rgba + first * sizeof(uint32_t), size_t(film.Width) * sizeof(uint32_t));
+        }
+        result = std::move(output);
+        return true;
+    }
+
+    bool EnsurePointGiPipelines(std::string& error) const
+    {
+        namespace G = MetalPointGi;
+        if (PointGiPipelines[G::Initialize] != nil)
+            return true;
+        if (@available(macOS 11.0, *))
+        {
+            NSError* detail = nil;
+            MTLCompileOptions* options = [[MTLCompileOptions alloc] init];
+            options.languageVersion = MTLLanguageVersion2_3;
+            options.fastMathEnabled = NO;
+            id<MTLLibrary> library =
+                [Device newLibraryWithSource:[NSString stringWithUTF8String:Detail::MetalPointGiSource]
+                                     options:options
+                                       error:&detail];
+            ReleaseObject(options);
+            if (library == nil)
+            {
+                error = ErrorDescription(detail, "Metal Point GI compilation failed.");
+                return false;
+            }
+            constexpr const char* Entries[G::StageCount] = {"ArvoPointGiInitialize", "ArvoPointGiBake",
+                                                            "ArvoPointGiCamera"};
+            id<MTLComputePipelineState> compiled[G::StageCount] = {};
+            bool valid = true;
+            for (uint32_t stage = 0; stage < G::StageCount && valid; ++stage)
+            {
+                id<MTLFunction> entry =
+                    [library newFunctionWithName:[NSString stringWithUTF8String:Entries[stage]]];
+                if (entry != nil)
+                    compiled[stage] = [Device newComputePipelineStateWithFunction:entry error:&detail];
+                ReleaseObject(entry);
+                if (compiled[stage] == nil || compiled[stage].maxTotalThreadsPerThreadgroup < G::Threads)
+                {
+                    error =
+                        std::string(Entries[stage]) + ": " +
+                        ErrorDescription(detail, "Metal Point GI pipeline cannot support its threadgroup.");
+                    valid = false;
+                }
+            }
+            ReleaseObject(library);
+            for (uint32_t stage = 0; stage < G::StageCount; ++stage)
+                if (valid)
+                    PointGiPipelines[stage] = compiled[stage];
+                else
+                    ReleaseObject(compiled[stage]);
+            return valid;
+        }
+        error = "Metal Point GI requires macOS 11 or later for MSL 2.3 arithmetic.";
+        return false;
+    }
+
+    bool RenderPointGi(const Scene& scene, const FrameConstants& constants, const PointGiOptions& options,
+                       const Detail::CancellationProbe& cancellation, RenderResult& result) const
+    {
+        namespace G = MetalPointGi;
+        if (!ValidatePointGiOptions(options, result.Error))
+            return false;
+        const auto emission = MetalEmission::PrepareEmitters(scene);
+        constexpr size_t UniformSourceLimit = size_t(1) << 24;
+        if (emission.Sources.size() > UniformSourceLimit)
+        {
+            result.Error = "Metal Point GI emitter count exceeds the uniform sampler's exact range.";
+            return false;
+        }
+        for (const auto& source : emission.Sources)
+            if (!(source.Flags & EmitterCastsShadows))
+            {
+                result.Error = "Metal Point GI requires shadow casting on every emitter.";
+                return false;
+            }
+        G::Geometry geometry;
+        if (constants.MaxReflectionBounces &&
+            !G::BuildGeometry(scene, options, cancellation, geometry, result.Error))
+            return false;
+        if (cancellation() || !EnsurePointGiPipelines(result.Error))
+            return false;
+        const size_t radianceBytes = geometry.Surfaces.size() * sizeof(G::Radiance);
+        const size_t maximumBytes = std::max(
+            {geometry.Surfaces.size() * sizeof(G::Surface), geometry.Nodes.size() * sizeof(G::Node),
+             geometry.Indices.size() * sizeof(uint32_t), emission.Sources.size() * sizeof(PackedEmitter),
+             radianceBytes, size_t(G::WorkBatch) * sizeof(GroupStatistics)});
+        if (maximumBytes > Device.maxBufferLength)
+        {
+            result.Error = "Metal Point GI cache exceeds the device's maximum buffer length.";
+            return false;
+        }
+        Buffer sources, surfaces, nodes, indices, previous, next, total, statistics, errors;
+        if (!CreateVectorBuffer(sources, emission.Sources, "Arvo Metal Point GI emitters", result.Error) ||
+            !CreateVectorBuffer(surfaces, geometry.Surfaces, "Arvo Metal Point GI surfaces", result.Error) ||
+            !CreateVectorBuffer(nodes, geometry.Nodes, "Arvo Metal Point GI hierarchy", result.Error) ||
+            !CreateVectorBuffer(indices, geometry.Indices, "Arvo Metal Point GI indices", result.Error) ||
+            !CreateBuffer(previous, radianceBytes, nullptr, "Arvo Metal Point GI previous order",
+                          result.Error) ||
+            !CreateBuffer(next, radianceBytes, nullptr, "Arvo Metal Point GI next order", result.Error) ||
+            !CreateBuffer(total, radianceBytes, nullptr, "Arvo Metal Point GI total", result.Error) ||
+            !CreateBuffer(statistics, size_t(G::WorkBatch) * sizeof(GroupStatistics), nullptr,
+                          "Arvo Metal Point GI statistics", result.Error) ||
+            !CreateBuffer(errors, sizeof(uint32_t), nullptr, "Arvo Metal Point GI status", result.Error))
+            return false;
+        G::Controls controls{uint32_t(geometry.Surfaces.size()),
+                             uint32_t(geometry.Nodes.size()),
+                             uint32_t(emission.Sources.size()),
+                             options.Seed ^ constants.SamplingSeed,
+                             options.DirectSamples,
+                             options.GatherSamples};
+        const auto dispatch = [&](uint32_t stage, uint32_t first, uint32_t count) {
+            if (cancellation() || !ResetTraversalError(result.Error))
+                return false;
+            controls.Begin = first;
+            controls.Count = count;
+            @autoreleasepool
+            {
+                id<MTLCommandBuffer> command = [CommandQueue commandBuffer];
+                id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+                if (command == nil || encoder == nil)
+                {
+                    result.Error = "Metal Point GI command allocation failed.";
+                    return false;
+                }
+                [encoder setComputePipelineState:PointGiPipelines[stage]];
+                [encoder setBuffer:Nodes.Handle offset:0 atIndex:0];
+                [encoder setBuffer:PrimitiveRefs.Handle offset:0 atIndex:1];
+                [encoder setBuffer:Triangles.Handle offset:0 atIndex:2];
+                [encoder setBuffer:Spheres.Handle offset:0 atIndex:3];
+                [encoder setBuffer:Materials.Handle offset:0 atIndex:4];
+                [encoder setBuffer:sources.Handle offset:0 atIndex:5];
+                [encoder setBytes:&constants length:sizeof(constants) atIndex:6];
+                [encoder setBuffer:Accumulation.Handle offset:0 atIndex:7];
+                [encoder setBuffer:SampleCounts.Handle offset:0 atIndex:8];
+                [encoder setBuffer:statistics.Handle offset:0 atIndex:9];
+                [encoder setBuffer:TextureDescriptors.Handle offset:0 atIndex:10];
+                [encoder setBuffer:TextureTexels.Handle offset:0 atIndex:11];
+                [encoder setBuffer:SampleTargets.Handle offset:0 atIndex:12];
+                BindInstanceBuffers(encoder);
+                [encoder setBuffer:surfaces.Handle offset:0 atIndex:G::SurfacesBinding];
+                [encoder setBuffer:nodes.Handle offset:0 atIndex:G::NodesBinding];
+                [encoder setBuffer:indices.Handle offset:0 atIndex:G::IndicesBinding];
+                [encoder setBuffer:previous.Handle offset:0 atIndex:G::PreviousBinding];
+                [encoder setBuffer:next.Handle offset:0 atIndex:G::NextBinding];
+                [encoder setBuffer:total.Handle offset:0 atIndex:G::TotalBinding];
+                [encoder setBytes:&controls length:sizeof(controls) atIndex:G::ControlsBinding];
+                [encoder setBuffer:errors.Handle offset:0 atIndex:G::ErrorsBinding];
+                const uint32_t groups = (count + G::Threads - 1) / G::Threads;
+                [encoder dispatchThreadgroups:MTLSizeMake(groups, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(G::Threads, 1, 1)];
+                [encoder endEncoding];
+                // Each order becomes immutable before swapping buffers. The command
+                // retains its resources if the shared device-lost timeout fires.
+                if (!CommitAndWait(command, "Metal Point GI dispatch", cancellation, result.Error) ||
+                    !CheckTraversalError(result.Error))
+                    return false;
+            }
+            const auto* failure = static_cast<const uint32_t*>(errors.Handle.contents);
+            if (!failure || *failure)
+            {
+                result.Error =
+                    "Metal Point GI kernel reported invalid configuration, cache or numerical state.";
+                return false;
+            }
+            if (stage != G::Initialize)
+            {
+                const auto* counters = static_cast<const GroupStatistics*>(statistics.Handle.contents);
+                if (!counters)
+                {
+                    result.Error = "Metal Point GI statistics are not CPU-visible.";
+                    return false;
+                }
+                for (uint32_t row = 0; row < count; ++row)
+                {
+                    result.Statistics.PrimaryRays += counters[row].PrimaryRays.Value();
+                    result.Statistics.ShadowRays += counters[row].ShadowRays.Value();
+                    result.Statistics.ReflectionRays += counters[row].ReflectionRays.Value();
+                    result.Statistics.PrimitiveTests += counters[row].PrimitiveTests.Value();
+                }
+            }
+            return true;
+        };
+        const auto population = [&](uint32_t stage, uint32_t count) {
+            for (uint32_t first = 0; first < count; first += G::WorkBatch)
+                if (!dispatch(stage, first, std::min(G::WorkBatch, count - first)))
+                    return false;
+            return true;
+        };
+        const auto samples = [&](uint32_t stage, uint32_t count, uint32_t budget) {
+            for (controls.FirstSample = 0; controls.FirstSample < budget;
+                 controls.FirstSample += G::SampleBatch)
+            {
+                controls.Samples = std::min(G::SampleBatch, budget - controls.FirstSample);
+                if (!population(stage, count))
+                    return false;
+            }
+            return true;
+        };
+        const uint32_t pixels = constants.Width * constants.Height;
+        if (!population(G::Initialize, pixels))
+            return false;
+        for (controls.Order = 0; controls.Order < constants.MaxReflectionBounces; ++controls.Order)
+        {
+            if (!samples(G::Bake, controls.Surfaces,
+                         controls.Order == 0 ? controls.DirectSamples : controls.GatherSamples))
+                return false;
+            std::swap(previous, next);
+        }
+        return samples(G::Camera, pixels, constants.TotalSamples);
+    }
+
     [[nodiscard]] RenderResult RenderNative(
         const Scene& scene,
         const std::shared_ptr<const Scene>& owner,
@@ -2620,8 +3578,38 @@ struct MetalRayTracingRHI::Impl
         {
             return result;
         }
+        if (!Detail::ValidateMaterialTransport(scene, BackendType::Metal,
+                settings.Integrator, result.Error)) return result;
+        const bool bidirectional = settings.Integrator == Algorithm::BidirectionalPathTracing;
+        const bool metropolis = settings.Integrator == Algorithm::MetropolisLightTransport;
+        const bool photon = settings.Integrator == Algorithm::PhotonMapping;
+        const bool progressive = settings.Integrator == Algorithm::ProgressivePhotonMapping;
+        const bool vcm = settings.Integrator == Algorithm::VertexConnectionMerging;
+        const bool pointGi = settings.Integrator == Algorithm::PointBasedGlobalIllumination;
+        if (pointGi && (settings.Adaptive.Enabled || settings.Transport.RussianRoulette ||
+            settings.MaxReflectionBounces > MetalPointGi::MaximumReflections ||
+            settings.Transport.Mis != MisHeuristic::None || !settings.Transport.NextEventEstimation ||
+            !settings.ShadowsEnabled || settings.ShadowStrength != 1))
+            return Detail::MakeFailedResult("Metal Point GI requires fixed samples/depth, NEE, no MIS and full visibility.");
+        if (vcm && (settings.Adaptive.Enabled || settings.Transport.RussianRoulette ||
+            !settings.ShadowsEnabled || settings.ShadowStrength != 1))
+            return Detail::MakeFailedResult("Metal VCM requires fixed passes/depth and full physical visibility.");
+        if (progressive && (settings.Adaptive.Enabled || settings.MaxReflectionBounces > MetalPpm::MaximumReflections ||
+            settings.Transport.Mis != MisHeuristic::None || !settings.ShadowsEnabled || settings.ShadowStrength != 1))
+            return Detail::MakeFailedResult("Metal PPM requires fixed passes, at most 32 reflections, no MIS and full physical visibility.");
+        if (photon && (settings.Adaptive.Enabled || settings.MaxReflectionBounces > MetalPhoton::MaximumReflections ||
+            settings.Transport.Mis != MisHeuristic::None || !settings.ShadowsEnabled || settings.ShadowStrength != 1))
+            return Detail::MakeFailedResult("Metal photon mapping requires fixed samples, at most 32 reflections, no connection MIS and full physical visibility.");
+        if (bidirectional && (settings.Adaptive.Enabled || settings.Transport.RussianRoulette ||
+            !settings.Transport.NextEventEstimation || !settings.ShadowsEnabled || settings.ShadowStrength != 1))
+            return Detail::MakeFailedResult("Metal BDPT requires fixed samples/depth, NEE and full physical visibility.");
+        if (metropolis && (settings.Adaptive.Enabled || settings.MaxReflectionBounces > MetalMlt::MaximumReflections ||
+            !settings.ShadowsEnabled || settings.ShadowStrength != 1))
+            return Detail::MakeFailedResult("Metal MLT requires fixed samples, at most 32 reflections and full physical visibility.");
         const auto buildBegin = std::chrono::steady_clock::now();
-        if (!EnsureScene(scene, owner, cancellation, result.Error))
+        if (!EnsureScene(scene, owner, {settings.Acceleration, settings.BvhPolicy}, cancellation,
+                         result.Error,
+                         settings.Radiometry == RadiometryMode::Spectral ? &settings.Medium : nullptr))
         {
             if (cancellation())
             {
@@ -2636,8 +3624,8 @@ struct MetalRayTracingRHI::Impl
         }
 
         const std::uint32_t pixelCount = settings.Width * settings.Height;
-        if (!EnsureFrameBuffers(pixelCount, result.Error)
-            || !ClearFrame(pixelCount, cancellation, result.Error))
+        if (!vcm && (!EnsureFrameBuffers(pixelCount, result.Error)
+            || !ClearFrame(pixelCount, cancellation, result.Error)))
         {
             if (cancellation())
             {
@@ -2654,6 +3642,19 @@ struct MetalRayTracingRHI::Impl
         constants.TileX = settings.TileX;
         constants.TileY = settings.TileY;
         constants.Integrator = static_cast<std::uint32_t>(settings.Integrator);
+        constexpr uint32_t SpectralTransportBit = 1u << 5;
+        constants.TransportFlags =
+            PackTransportFlags(settings.Transport) |
+            (settings.Radiometry == RadiometryMode::Spectral ? SpectralTransportBit : 0);
+        constants.RouletteStartDepth = settings.Transport.RouletteStartDepth;
+        constants.SamplingSequence = static_cast<uint32_t>(settings.Sampling);
+        constants.SamplingSeed = settings.SamplingSeed;
+        constants.Acceleration = static_cast<std::uint32_t>(settings.Acceleration);
+        constants.AdaptiveEnabled = settings.Adaptive.Enabled ? 1u : 0u;
+        constants.AdaptivePilotSamples = settings.Adaptive.PilotSamples;
+        constants.AdaptiveMinimumSamples = settings.Adaptive.MinimumSamples;
+        constants.AdaptiveRelativeError = settings.Adaptive.RelativeError;
+        constants.AdaptiveAbsoluteError = settings.Adaptive.AbsoluteError;
         constants.Height = settings.Height;
         constants.TotalSamples = settings.SamplesPerPixel;
         constants.MaxReflectionBounces = settings.MaxReflectionBounces;
@@ -2661,6 +3662,8 @@ struct MetalRayTracingRHI::Impl
             Subtract(ToVec3(camera.Target), ToVec3(camera.Position)));
         const Vec3 right = NormalizeVector(CrossVector(forward, ToVec3(camera.Up)));
         constants.CameraForward = forward;
+        constants.LensRadius = camera.Lens.Radius;
+        constants.FocusDistance = camera.Lens.FocusDistance;
         constants.CameraRight = right;
         constants.CameraUp = NormalizeVector(CrossVector(right, forward));
         constants.HalfHeight =
@@ -2674,6 +3677,7 @@ struct MetalRayTracingRHI::Impl
         constants.AmbientIntensity = scene.AmbientIntensity;
         constants.BackgroundBottom = ToVec3(scene.BackgroundBottom);
         constants.NodeCount = NodeCount;
+        constants.InstanceNodeCount = InstanceNodeCount;
         constants.PrimitiveRefCount = PrimitiveRefCount;
         constants.TriangleCount = TriangleCount;
         constants.SphereCount = SphereCount;
@@ -2685,51 +3689,99 @@ struct MetalRayTracingRHI::Impl
         constants.TextureTexelCount = TextureTexelCount;
 
         const auto renderBegin = std::chrono::steady_clock::now();
-        for (std::uint32_t sample = 0u;
-             sample < settings.SamplesPerPixel;
-             ++sample)
+        if (vcm)
         {
-            for (std::uint32_t begin = 0u;
-                 begin < pixelCount;
-                 begin += PixelChunkSize)
+            bool success = RenderVcm(scene, constants, settings, cancellation, result);
+            result.Statistics.BuildMilliseconds = std::chrono::duration<double, std::milli>(buildEnd - buildBegin).count();
+            result.Statistics.RenderMilliseconds = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - renderBegin).count();
+            result.Status = cancellation() ? RenderStatus::Cancelled : success ? RenderStatus::Completed : RenderStatus::Failed;
+            if (!success) { result.Film = {}; result.Output = {}; result.Statistics.CompletedPixels = 0; }
+            return result;
+        }
+        constexpr std::uint32_t PilotPhase = 1u;
+        const bool variancePilot = settings.Adaptive.Enabled && !settings.ProductionBudgets;
+        const std::uint32_t phaseCount = variancePilot ? 2u : 1u;
+        if (settings.ProductionBudgets)
+            std::memcpy(SampleTargets.Handle.contents, settings.ProductionBudgets->Counts.data(),
+                        size_t(pixelCount) * sizeof(uint32_t));
+        if (bidirectional && !RenderBidirectional(scene, constants, cancellation, result))
+        {
+            if (cancellation()) result.Status = RenderStatus::Cancelled;
+            return result;
+        }
+        if (metropolis && !RenderMetropolis(scene, constants, settings.Metropolis, cancellation, result))
+        {
+            if (cancellation()) result.Status = RenderStatus::Cancelled;
+            return result;
+        }
+        if (photon && !RenderPhotons(scene, constants, settings.Photons, cancellation, result))
+        {
+            if (cancellation()) result.Status = RenderStatus::Cancelled;
+            return result;
+        }
+        if (progressive && !RenderProgressivePhotons(scene, constants, settings.ProgressivePhotons, cancellation, result))
+        {
+            if (cancellation()) result.Status = RenderStatus::Cancelled;
+            return result;
+        }
+        if (pointGi && !RenderPointGi(scene, constants, settings.PointGi, cancellation, result))
+        {
+            if (cancellation()) result.Status = RenderStatus::Cancelled;
+            return result;
+        }
+        for (std::uint32_t phase = 0u; !bidirectional && !metropolis && !photon && !progressive && !pointGi && phase < phaseCount; ++phase)
+        {
+            const bool pilot = variancePilot && phase == 0u;
+            constants.AdaptivePhase = pilot ? PilotPhase : uint32_t(settings.SampleStream);
+            const std::uint32_t phaseSamples = pilot ? settings.Adaptive.PilotSamples : settings.SamplesPerPixel;
+            for (std::uint32_t sample = 0u;
+                 sample < phaseSamples;
+                 ++sample)
             {
-                if (cancellation())
-                {
-                    result.Status = RenderStatus::Cancelled;
-                    result.Statistics.BuildMilliseconds =
-                        std::chrono::duration<double, std::milli>(
-                            buildEnd - buildBegin).count();
-                    result.Statistics.RenderMilliseconds =
-                        std::chrono::duration<double, std::milli>(
-                            std::chrono::steady_clock::now() - renderBegin).count();
-                    return result;
-                }
-                constants.PixelBegin = begin;
-                constants.PixelCount = std::min(PixelChunkSize, pixelCount - begin);
-                constants.SampleBegin = sample;
-                constants.SampleCount = 1u;
-                constants.GroupCount =
-                    (constants.PixelCount + ThreadsPerGroup - 1u)
-                    / ThreadsPerGroup;
-                GroupStatistics statistics;
-                if (!DispatchTrace(
-                        constants,
-                        statistics,
-                        cancellation,
-                        result.Error))
+                std::uint64_t passPrimaryRays = 0;
+                for (std::uint32_t begin = 0u;
+                     begin < pixelCount;
+                     begin += PixelChunkSize)
                 {
                     if (cancellation())
                     {
                         result.Status = RenderStatus::Cancelled;
+                        result.Statistics.BuildMilliseconds =
+                            std::chrono::duration<double, std::milli>(
+                                buildEnd - buildBegin).count();
+                        result.Statistics.RenderMilliseconds =
+                            std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - renderBegin).count();
+                        return result;
                     }
-                    return result;
+                    constants.PixelBegin = begin;
+                    constants.PixelCount = std::min(PixelChunkSize, pixelCount - begin);
+                    constants.SampleBegin = sample;
+                    constants.SampleCount = 1u;
+                    constants.GroupCount =
+                        (constants.PixelCount + ThreadsPerGroup - 1u)
+                        / ThreadsPerGroup;
+                    GroupStatistics statistics;
+                    if (!DispatchTrace(constants, PackMedium(settings.Medium), {camera.Motion, HasSceneMotion(scene)}, statistics,
+                                       cancellation, result.Error))
+                    {
+                        if (cancellation())
+                        {
+                            result.Status = RenderStatus::Cancelled;
+                        }
+                        return result;
+                    }
+                    result.Statistics.PrimaryRays += statistics.PrimaryRays.Value();
+                    passPrimaryRays += statistics.PrimaryRays.Value();
+                    if (pilot) result.Statistics.PilotRays += statistics.PrimaryRays.Value();
+                    result.Statistics.ShadowRays += statistics.ShadowRays.Value();
+                    result.Statistics.ReflectionRays +=
+                        statistics.ReflectionRays.Value();
+                    result.Statistics.PrimitiveTests +=
+                        statistics.PrimitiveTests.Value();
                 }
-                result.Statistics.PrimaryRays += statistics.PrimaryRays.Value();
-                result.Statistics.ShadowRays += statistics.ShadowRays.Value();
-                result.Statistics.ReflectionRays +=
-                    statistics.ReflectionRays.Value();
-                result.Statistics.PrimitiveTests +=
-                    statistics.PrimitiveTests.Value();
+                // Fixed targets cannot become active again after an empty pass.
+                if (!pilot && passPrimaryRays == 0) break;
             }
         }
 
@@ -2749,12 +3801,15 @@ struct MetalRayTracingRHI::Impl
         const void* output = Output.Handle.contents;
         const auto* completedSamples =
             static_cast<const std::uint32_t*>(SampleCounts.Handle.contents);
-        if (output == nullptr || completedSamples == nullptr)
+        const auto* filmMoments = static_cast<const Vec4*>(Accumulation.Handle.contents);
+        const auto* sampleTargets = static_cast<const std::uint32_t*>(SampleTargets.Handle.contents);
+        if (output == nullptr || completedSamples == nullptr || filmMoments == nullptr || sampleTargets == nullptr)
         {
             result.Error = "Metal frame readback buffers are not CPU-visible.";
             return result;
         }
         result.Output = Image(settings.Width, settings.Height);
+        result.Film = LinearFilm(settings.Width, settings.Height);
         std::vector<std::uint8_t>& pixels = result.Output.GetPixelsRGBA8();
         constexpr std::size_t ReadbackChunkSize = 32u * 1024u * 1024u;
         const std::size_t outputBytes =
@@ -2776,10 +3831,16 @@ struct MetalRayTracingRHI::Impl
         }
         for (std::uint32_t pixel = 0u; pixel < pixelCount; ++pixel)
         {
-            if (completedSamples[pixel] == settings.SamplesPerPixel)
+            const std::uint32_t minimum = settings.Adaptive.Enabled ? settings.Adaptive.MinimumSamples : settings.SamplesPerPixel;
+            if (sampleTargets[pixel] < minimum || sampleTargets[pixel] > settings.SamplesPerPixel
+                || completedSamples[pixel] != sampleTargets[pixel])
             {
-                ++result.Statistics.CompletedPixels;
+                result.Error = "Metal did not complete the selected per-pixel sample budget.";
+                return result;
             }
+            const Vec4& value = filmMoments[pixel];
+            result.Film.Pixels[pixel] = {Float3(value.X, value.Y, value.Z), value.W, completedSamples[pixel]};
+            ++result.Statistics.CompletedPixels;
         }
         const auto renderEnd = std::chrono::steady_clock::now();
         result.Statistics.BuildMilliseconds =
@@ -2796,8 +3857,24 @@ struct MetalRayTracingRHI::Impl
 
     id<MTLDevice> Device = nil;
     id<MTLCommandQueue> CommandQueue = nil;
-    id<MTLComputePipelineState> TracePipeline = nil;
+    id<MTLComputePipelineState> WhittedPipeline = nil;
+    id<MTLComputePipelineState> QueryPipeline = nil;
+    id<MTLComputePipelineState> PathTracingPipeline = nil;
+    id<MTLComputePipelineState> DistributedRayPipeline = nil;
     id<MTLComputePipelineState> ResolvePipeline = nil;
+    mutable id<MTLComputePipelineState> SpatialDenoisePipeline = nil;
+    mutable id<MTLComputePipelineState> AdaptiveDenoisePipeline = nil;
+    mutable id<MTLComputePipelineState> GeometryGuidePipelines[2] = {};
+    mutable id<MTLComputePipelineState> TemporalDenoisePipeline = nil;
+    mutable id<MTLComputePipelineState> DicingPipeline = nil;
+    mutable id<MTLComputePipelineState> BidirectionalPairs = nil;
+    mutable id<MTLComputePipelineState> BidirectionalClear = nil;
+    mutable id<MTLComputePipelineState> BidirectionalCommit = nil;
+    mutable id<MTLComputePipelineState> MetropolisPipelines[MetalMlt::StageCount] = {};
+    mutable id<MTLComputePipelineState> PhotonPipelines[MetalPhoton::StageCount] = {};
+    mutable id<MTLComputePipelineState> ProgressivePipelines[MetalPpm::StageCount] = {};
+    mutable id<MTLComputePipelineState> PointGiPipelines[MetalPointGi::StageCount] = {};
+    mutable id<MTLComputePipelineState> VcmPipelines[MetalVcm::StageCount] = {};
     mutable std::mutex AvailabilityMutex;
     mutable bool Available = false;
     mutable bool Terminal = false;
@@ -2805,6 +3882,9 @@ struct MetalRayTracingRHI::Impl
     mutable std::string DeviceName;
 
     mutable Buffer Nodes;
+    mutable Buffer InstanceRecords;
+    mutable Buffer InstanceNodes;
+    mutable Buffer InstanceError;
     mutable Buffer PrimitiveRefs;
     mutable Buffer Triangles;
     mutable Buffer Spheres;
@@ -2812,11 +3892,19 @@ struct MetalRayTracingRHI::Impl
     mutable Buffer Lights;
     mutable Buffer TextureDescriptors;
     mutable Buffer TextureTexels;
+    mutable Buffer SpectralPalette;
+    mutable Buffer SpectralReferences;
+    mutable Buffer SpectralFallback;
+    mutable uint32_t SpectralSceneSourceCount = 0;
+    mutable MediumOptions SpectralMedium;
+    mutable id<MTLComputePipelineState> SpectralResponsePipeline = nil, SpectralPalettePipeline = nil;
     mutable Buffer Accumulation;
     mutable Buffer SampleCounts;
+    mutable Buffer SampleTargets;
     mutable Buffer Output;
     mutable Buffer GroupStats;
     mutable std::uint32_t NodeCount = 0u;
+    mutable std::uint32_t InstanceNodeCount = 0u;
     mutable std::uint32_t PrimitiveRefCount = 0u;
     mutable std::uint32_t TriangleCount = 0u;
     mutable std::uint32_t SphereCount = 0u;
@@ -2826,6 +3914,7 @@ struct MetalRayTracingRHI::Impl
     mutable std::uint32_t TextureTexelCount = 0u;
     mutable std::uint32_t FramePixelCapacity = 0u;
     mutable std::weak_ptr<const Scene> CachedOwner;
+    mutable AccelerationOptions CachedAcceleration = AccelerationType::Bvh;
     mutable Detail::PersistentRenderQueue MetalQueue;
 };
 
@@ -2846,13 +3935,160 @@ BackendInfo MetalRayTracingRHI::GetBackendInfo() const
     info.IsHardwareAccelerated = availability.Available;
     info.IsAvailable = availability.Available;
     info.Description = availability.Available
-        ? std::string("Native Metal compute BVH backend on ")
+        ? std::string("Native Metal compute ray tracing backend on ")
             + availability.DeviceName
         : std::string("Unavailable")
             + (availability.Terminal ? " (terminal)" : "")
             + ": "
             + availability.Error;
     return info;
+}
+
+RayQueryResult MetalRayTracingRHI::QueryRays(const Scene& scene, const std::vector<Ray>& rays,
+    AccelerationOptions acceleration,
+    const CancellationToken& cancellation) const
+{
+    RayQueryResult result;
+    // Use the same queue as renders so packed scene and GPU resources are serial.
+    auto job = m_Impl->MetalQueue.Submit([&](const CancellationToken& queued)
+    {
+        const auto probe = Detail::CombineCancellation(queued, cancellation);
+        if (probe()) return Detail::MakeCancelledResult();
+        const auto availability = m_Impl->GetAvailability();
+        if (!availability.Available) return Detail::MakeFailedResult("Metal is unavailable: " + availability.Error);
+        @autoreleasepool
+        {
+            result = m_Impl->QueryNative(scene, rays, acceleration, probe);
+            RenderResult completion;
+            completion.Status = result.Status;
+            completion.Error = result.Error;
+            return completion;
+        }
+    });
+    const auto completion = job.GetResult();
+    result.Status = completion.Status;
+    result.Error = completion.Error;
+    return result;
+}
+
+MicropolygonResult MetalRayTracingRHI::PrepareMicropolygons(const Scene& scene, const Camera& camera,
+                                                            const RenderSettings& settings,
+                                                            const CancellationToken& cancellation) const
+{
+    MicropolygonResult result;
+    const auto task =
+        m_Impl->MetalQueue
+            .Submit([&](const CancellationToken& queued) {
+                const auto stopped = Detail::CombineCancellation(queued, cancellation);
+                if (stopped())
+                    return Detail::MakeCancelledResult();
+                const auto availability = m_Impl->GetAvailability();
+                if (!availability.Available)
+                    return Detail::MakeFailedResult("Metal is unavailable: " + availability.Error);
+                @autoreleasepool
+                {
+                    result = Detail::PrepareMicropolygons(scene, camera, settings, stopped,
+                                                          [&](const auto& controls, const auto& patches,
+                                                              const auto& ranges, auto& words, auto& error) {
+                                                              return m_Impl->MicropolygonPassNative(
+                                                                  controls, patches, ranges, words, stopped,
+                                                                  error);
+                                                          });
+                    RenderResult completion;
+                    completion.Status = result.Status;
+                    completion.Error = result.Error;
+                    return completion;
+                }
+            })
+            .GetResult();
+    result.Status = task.Status;
+    result.Error = task.Error;
+    return result;
+}
+
+TemporalResult MetalRayTracingRHI::ReconstructTemporal(const TemporalFrame& frame,
+                                                       const TemporalHistory* history,
+                                                       const TemporalOptions& options,
+                                                       const CancellationToken& cancellation) const
+{
+    TemporalResult result;
+    const auto task =
+        m_Impl->MetalQueue
+            .Submit([&](const CancellationToken& queued) {
+                const auto stopped = Detail::CombineCancellation(queued, cancellation);
+                if (stopped())
+                    return Detail::MakeCancelledResult();
+                const auto availability = m_Impl->GetAvailability();
+                if (!availability.Available)
+                    return Detail::MakeFailedResult("Metal is unavailable: " + availability.Error);
+                @autoreleasepool
+                {
+                    result = Detail::ReconstructTemporal(
+                        BackendType::Metal, frame, history, options, stopped,
+                        [&](const auto& controls, const auto& current, const auto& guides,
+                            const auto& previous, const auto& oldGuides, auto& output, auto& display,
+                            auto& error) {
+                            return m_Impl->ReconstructTemporalNative(controls, current, guides, previous,
+                                                                     oldGuides, stopped, output, display,
+                                                                     error);
+                        });
+                    RenderResult completion;
+                    completion.Status = result.Status;
+                    completion.Error = result.Error;
+                    return completion;
+                }
+            })
+            .GetResult();
+    result.Status = task.Status;
+    result.Error = task.Error;
+    if (result.Status != RenderStatus::Completed)
+    {
+        result.History = {};
+        result.Display = {};
+        result.AcceptedHistoryPixels = 0;
+    }
+    return result;
+}
+
+GeometryGuideResult MetalRayTracingRHI::CaptureGeometryGuides(const Scene& scene, const Camera& camera,
+                                                              const RenderSettings& settings,
+                                                              const CancellationToken& cancellation) const
+{
+    GeometryGuideResult result;
+    if (settings.Micropolygons.Enabled)
+    {
+        auto diced = PrepareMicropolygons(scene, camera, settings, cancellation);
+        if (diced.Status != RenderStatus::Completed)
+            return {diced.Status, {}, diced.Error};
+        auto prepared = settings;
+        prepared.Micropolygons.Enabled = false;
+        prepared.DicingPlan.reset();
+        return CaptureGeometryGuides(*diced.Geometry, camera, prepared, cancellation);
+    }
+    const auto task =
+        m_Impl->MetalQueue
+            .Submit([&](const CancellationToken& queued) {
+                const auto stopped = Detail::CombineCancellation(queued, cancellation);
+                if (stopped())
+                    return Detail::MakeCancelledResult();
+                const auto availability = m_Impl->GetAvailability();
+                if (!availability.Available)
+                    return Detail::MakeFailedResult("Metal is unavailable: " + availability.Error);
+                @autoreleasepool
+                {
+                    result = m_Impl->CaptureGuidesNative(scene, camera, settings, stopped);
+                    RenderResult completion;
+                    completion.Status = result.Status;
+                    completion.Error = result.Error;
+                    return completion;
+                }
+            })
+            .GetResult();
+    result.Status = task.Status;
+    result.Error = task.Error;
+    if (result.Status != RenderStatus::Completed)
+        result.Image = {};
+    return result;
 }
 
 RenderResult MetalRayTracingRHI::Render(

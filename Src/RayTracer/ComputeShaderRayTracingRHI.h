@@ -6,13 +6,29 @@ namespace Arvo
 {
 namespace RayTracing
 {
+    // WARP executes the same compiled HLSL on Microsoft's software D3D12 device.
+    // It is an explicitly requested diagnostic, never an automatic GPU fallback.
+    enum class ComputeDeviceSelection { Hardware, WarpDiagnostic };
+
     class ARVO_RAYTRACER_API ComputeShaderRayTracingRHI final : public IRayTracingRHI
     {
     public:
         ComputeShaderRayTracingRHI();
+        explicit ComputeShaderRayTracingRHI(ComputeDeviceSelection selection);
         ~ComputeShaderRayTracingRHI() override;
 
         BackendInfo GetBackendInfo() const override;
+        MicropolygonResult PrepareMicropolygons(const Scene&, const Camera&, const RenderSettings&,
+            const CancellationToken& = CancellationToken()) const override;
+        TemporalResult ReconstructTemporal(const TemporalFrame&, const TemporalHistory*,
+                                           const TemporalOptions&,
+                                           const CancellationToken& = CancellationToken()) const override;
+        GeometryGuideResult CaptureGeometryGuides(
+            const Scene&, const Camera&, const RenderSettings&,
+            const CancellationToken& = CancellationToken()) const override;
+        RayQueryResult QueryRays(const Scene& scene, const std::vector<Ray>& rays,
+            AccelerationOptions acceleration = AccelerationType::Bvh,
+            const CancellationToken& cancellation = CancellationToken()) const override;
         RenderResult Render(
             const Scene& scene,
             const Camera& camera,

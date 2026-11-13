@@ -34,7 +34,6 @@ public:
         int viewportHeight) = 0;
     virtual void DrawImgui() = 0;
     virtual bool EndFrame() = 0;
-    virtual bool CaptureBackBuffer(Image& output) = 0;
 
     [[nodiscard]] virtual bool IsInitialized() const noexcept = 0;
     [[nodiscard]] virtual EditorPresentationAPI API() const noexcept = 0;

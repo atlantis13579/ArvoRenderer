@@ -5,6 +5,7 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,7 +14,8 @@ namespace Arvo::Editor
 
 enum class RenderDomain
 {
-    RealtimeRenderer
+    RealtimeRenderer,
+    RayTracing
 };
 
 enum class HostPlatform
@@ -30,12 +32,24 @@ enum class BackendPlatform
     Apple
 };
 
+// Usage is independent of API ownership and numerical integrator support.
+enum class BackendUsage
+{
+    Preview,
+    Offline,
+    PreviewAndOffline
+};
+
 struct BackendDescriptor
 {
     std::string Id;
     std::string DisplayName;
     RenderDomain Domain = RenderDomain::RealtimeRenderer;
     BackendPlatform Platform = BackendPlatform::Any;
+    std::optional<RayTracing::BackendType> TransportBackend;
+    BackendUsage Usage = BackendUsage::Preview;
+    bool SupportsPreview() const { return Usage != BackendUsage::Offline; }
+    bool SupportsOffline() const { return Usage != BackendUsage::Preview; }
 };
 
 enum class RenderStatus
@@ -83,6 +97,10 @@ struct RenderResult
     RenderStatus Status = RenderStatus::Failed;
     Image Output;
     std::string Error;
+    // Called by the owner only after generation/backend/image validation.
+    // Stateful adapters publish history here, never from a background task.
+    std::function<bool()> Accept;
+    bool ContinueRendering = false;
 };
 
 class IRenderAdapter
@@ -91,6 +109,7 @@ public:
     virtual ~IRenderAdapter() = default;
     [[nodiscard]] virtual BackendDescriptor Descriptor() const = 0;
     [[nodiscard]] virtual bool IsAvailable() const { return true; }
+    virtual void ResetTemporalHistory() {}
     [[nodiscard]] virtual RenderResult Render(
         const RenderRequest& request,
         const CancellationToken& cancellation) = 0;

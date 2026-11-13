@@ -546,60 +546,6 @@ float4 PS(VSOutput input) : SV_TARGET
         return SUCCEEDED(result) || Fail(HResultMessage("IDXGISwapChain::Present", result));
     }
 
-    bool CaptureBackBuffer(Image& output)
-    {
-        output = {};
-        if (SwapChain == nullptr || Context == nullptr || Device == nullptr)
-        {
-            return false;
-        }
-        ID3D11Texture2D* backBuffer = nullptr;
-        HRESULT result = SwapChain->GetBuffer(
-            0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&backBuffer));
-        if (FAILED(result))
-        {
-            return Fail(HResultMessage("Get back buffer for capture", result));
-        }
-        D3D11_TEXTURE2D_DESC desc = {};
-        backBuffer->GetDesc(&desc);
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        desc.MiscFlags = 0;
-        ID3D11Texture2D* staging = nullptr;
-        result = Device->CreateTexture2D(&desc, nullptr, &staging);
-        if (SUCCEEDED(result))
-        {
-            Context->CopyResource(staging, backBuffer);
-        }
-        backBuffer->Release();
-        if (FAILED(result))
-        {
-            return Fail(HResultMessage("Create capture texture", result));
-        }
-        D3D11_MAPPED_SUBRESOURCE mapped = {};
-        result = Context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
-        if (FAILED(result))
-        {
-            staging->Release();
-            return Fail(HResultMessage("Map capture texture", result));
-        }
-        output.Width = desc.Width;
-        output.Height = desc.Height;
-        output.PixelsRGBA8.resize(static_cast<std::size_t>(desc.Width) * desc.Height * 4u);
-        const std::size_t destinationPitch = static_cast<std::size_t>(desc.Width) * 4u;
-        for (std::uint32_t row = 0; row < desc.Height; ++row)
-        {
-            std::memcpy(
-                output.PixelsRGBA8.data() + static_cast<std::size_t>(row) * destinationPitch,
-                static_cast<const std::uint8_t*>(mapped.pData) + static_cast<std::size_t>(row) * mapped.RowPitch,
-                destinationPitch);
-        }
-        Context->Unmap(staging, 0);
-        staging->Release();
-        return true;
-    }
-
     HWND Window = nullptr;
     int Width = 0;
     int Height = 0;
@@ -671,11 +617,6 @@ void EditorPresenterDX11::DrawImgui()
 bool EditorPresenterDX11::EndFrame()
 {
     return Impl_->EndFrame();
-}
-
-bool EditorPresenterDX11::CaptureBackBuffer(Image& output)
-{
-    return Impl_->CaptureBackBuffer(output);
 }
 
 bool EditorPresenterDX11::IsInitialized() const noexcept

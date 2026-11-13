@@ -1,4 +1,5 @@
 #include "Editor/RenderAdapter.hpp"
+#include "Renderer/RayTracing.h"
 
 #include <stdexcept>
 #include <utility>
@@ -61,9 +62,18 @@ RenderResult CallbackRenderAdapter::Render(
 const std::vector<BackendDescriptor>& StandardBackendCatalog()
 {
     static const std::vector<BackendDescriptor> backends = {
-        {"renderer.dx11", "DX11 preview", RenderDomain::RealtimeRenderer, BackendPlatform::Windows},
-        {"renderer.dxr", "DXR preview", RenderDomain::RealtimeRenderer, BackendPlatform::Windows},
-        {"renderer.metal", "Metal preview", RenderDomain::RealtimeRenderer, BackendPlatform::Apple}};
+        {"renderer.dx11", "DX11 raster preview", RenderDomain::RealtimeRenderer, BackendPlatform::Windows,
+         std::nullopt, BackendUsage::Preview},
+        {"renderer.dxr", "DXR ray-traced preview", RenderDomain::RealtimeRenderer, BackendPlatform::Windows,
+         RayTracing::BackendType::DXR, BackendUsage::PreviewAndOffline},
+        {"integrator.cpu", "CPU offline", RenderDomain::RayTracing, BackendPlatform::Any,
+         RayTracing::BackendType::CPU, BackendUsage::Offline},
+        {"integrator.cuda", "CUDA offline", RenderDomain::RayTracing, BackendPlatform::Windows,
+         RayTracing::BackendType::CUDA, BackendUsage::Offline},
+        {"integrator.compute", "Compute offline", RenderDomain::RayTracing, BackendPlatform::Windows,
+         RayTracing::BackendType::ComputeShader, BackendUsage::Offline},
+        {"integrator.metal", "Metal offline", RenderDomain::RayTracing, BackendPlatform::Apple,
+         RayTracing::BackendType::Metal, BackendUsage::Offline}};
     return backends;
 }
 

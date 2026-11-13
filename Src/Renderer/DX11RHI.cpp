@@ -1,5 +1,6 @@
 #include "Renderer/DX11RHI.h"
-#include "Renderer/RealtimeShader.h"
+#include "Renderer/DX11Shading.h"
+#include "Renderer/DX11MicropolygonDicing.h"
 #include "Renderer/RealtimeShaderContract.h"
 
 #include <algorithm>
@@ -19,8 +20,8 @@
 #undef min
 #undef max
 #include <d3d11.h>
-#include <d3dcompiler.h>
 #include <wrl/client.h>
+#include "DX11ShaderBytecode.h"
 #endif
 
 namespace Arvo::Renderer
@@ -30,496 +31,6 @@ namespace Arvo::Renderer
 
 	namespace
 	{
-		constexpr const char* ShaderSourceTemplate = R"(
-struct LightConstants
-{
-    float4 PositionType;
-    float4 DirectionIntensity;
-    float4 ColorCastShadows;
-    float4 AreaSizePadding;
-};
-
-cbuffer DrawConstants : register(b{{DRAWCONSTANTS_BINDING}})
-{
-    row_major float4x4 World;
-    row_major float4x4 NormalWorld;
-    row_major float4x4 ViewProjection;
-    row_major float4x4 LightViewProjection;
-    float4 PipelineColor;
-    float4 MaterialDiffuseColor;
-    float4 MaterialAmbientColor;
-    float4 MaterialSpecularColor;
-    float4 MaterialEmissiveColor;
-    float4 MaterialParameters;
-    float4 AmbientColorStrength;
-    float4 CameraLightCount;
-    float4 RenderParameters;
-    uint4 TextureFlags;
-    LightConstants Lights[{{MAX_LIGHTS}}];
-};
-
-Texture2D<float> ShadowMap : register(t{{SHADOWMAP_BINDING}});
-Texture2D<float4> DiffuseMap : register(t{{DIFFUSEMAP_BINDING}});
-Texture2D<float4> NormalMap : register(t{{NORMALMAP_BINDING}});
-Texture2D<float4> OpacityMap : register(t{{OPACITYMAP_BINDING}});
-SamplerState SurfaceSampler : register(s{{SURFACESAMPLER_BINDING}});
-
-float3 SRGBToLinear(float3 color)
-{
-    float3 low = color / 12.92f;
-    float3 high = pow((color + 0.055f) / 1.055f, 2.4f);
-    return float3(
-        color.r <= 0.04045f ? low.r : high.r,
-        color.g <= 0.04045f ? low.g : high.g,
-        color.b <= 0.04045f ? low.b : high.b);
-}
-
-float3 PrepareDisplayLinear(float3 color)
-{
-    color = max(color, 0.0f);
-    color /= max(1.0f, max(color.r, max(color.g, color.b)));
-    return saturate(color);
-}
-
-float3 NormalizeSafe(float3 value, float3 fallback)
-{
-    float lengthSquared = dot(value, value);
-    return lengthSquared > 1.0e-12f ? value * rsqrt(lengthSquared) : fallback;
-}
-
-struct VSInput
-{
-    float3 Position : POSITION;
-    float3 Normal : NORMAL;
-    float4 Color : COLOR0;
-    float2 TexCoord : TEXCOORD0;
-};
-
-struct VSOutput
-{
-    float4 Position : SV_POSITION;
-    float3 WorldPosition : TEXCOORD0;
-    float3 Normal : TEXCOORD1;
-    float4 Color : COLOR0;
-    float4 LightPosition : TEXCOORD2;
-    float2 TexCoord : TEXCOORD3;
-};
-
-VSOutput {{VERTEX_ENTRY}}(VSInput input)
-{
-    VSOutput output;
-    float4 worldPosition = mul(World, float4(input.Position, 1.0f));
-    float3 worldNormal = NormalizeSafe(
-        mul((float3x3)NormalWorld, input.Normal),
-        float3(0.0f, 1.0f, 0.0f));
-    output.Position = mul(ViewProjection, worldPosition);
-    output.WorldPosition = worldPosition.xyz / max(abs(worldPosition.w), 1.0e-7f);
-    output.Normal = worldNormal;
-    output.Color = float4(SRGBToLinear(saturate(input.Color.rgb)), input.Color.a);
-    output.LightPosition = mul(LightViewProjection, worldPosition);
-    output.TexCoord = float2(input.TexCoord.x, 1.0f - input.TexCoord.y);
-    return output;
-}
-
-float4 SampleDiffuse(float2 texCoord)
-{
-    return TextureFlags.x != 0
-        ? DiffuseMap.Sample(SurfaceSampler, texCoord)
-        : float4(1.0f, 1.0f, 1.0f, 1.0f);
-}
-
-float SampleOpacity(float2 texCoord)
-{
-    return TextureFlags.z != 0
-        ? OpacityMap.Sample(SurfaceSampler, texCoord).r
-        : 1.0f;
-}
-
-float SurfaceAlpha(VSOutput input, float4 diffuseSample)
-{
-    return saturate(
-        input.Color.a *
-        MaterialParameters.y *
-        diffuseSample.a *
-        SampleOpacity(input.TexCoord));
-}
-
-void ApplyAlphaClip(float alpha)
-{
-    if (MaterialParameters.z > 0.0f)
-    {
-        clip(alpha - MaterialParameters.z);
-    }
-}
-
-void ApplyShadowAlpha(float alpha, float2 pixelPosition)
-{
-    if (MaterialParameters.z > 0.0f)
-    {
-        clip(alpha - MaterialParameters.z);
-        return;
-    }
-    if (RenderParameters.w > 0.5f)
-    {
-        if (alpha <= 0.0f)
-        {
-            clip(-1.0f);
-        }
-        if (alpha >= 1.0f)
-        {
-            return;
-        }
-        // Stable screen-space coverage approximates transmission in a depth-only
-        // shadow map while guaranteeing fully transparent texels cast no shadow.
-        float threshold = frac(
-            52.9829189f *
-            frac(dot(floor(pixelPosition), float2(0.06711056f, 0.00583715f))));
-        clip(alpha - threshold);
-    }
-}
-
-float SampleShadow(
-    float4 lightPosition,
-    float3 surfaceNormal,
-    float3 directionToLight)
-{
-    if (RenderParameters.x < 0.5f || abs(lightPosition.w) < 1.0e-7f)
-    {
-        return 1.0f;
-    }
-    float3 projected = lightPosition.xyz / lightPosition.w;
-    float2 uv = float2(projected.x * 0.5f + 0.5f, 0.5f - projected.y * 0.5f);
-    if (any(uv < 0.0f) || any(uv > 1.0f) || projected.z < 0.0f || projected.z > 1.0f)
-    {
-        return 1.0f;
-    }
-    uint width;
-    uint height;
-    ShadowMap.GetDimensions(width, height);
-    if (width == 0 || height == 0)
-    {
-        return 1.0f;
-    }
-    float lightDirectionLengthSquared =
-        dot(directionToLight, directionToLight);
-    float3 normalizedLightDirection =
-        lightDirectionLengthSquared > 1.0e-12f
-        ? directionToLight * rsqrt(lightDirectionLengthSquared)
-        : surfaceNormal;
-    float normalToLight = saturate(
-        dot(surfaceNormal, normalizedLightDirection));
-    float sineToLight = sqrt(max(
-        1.0f - normalToLight * normalToLight,
-        0.0f));
-    float slope = sineToLight / max(normalToLight, 0.15f);
-    float receiverBias = min(
-        0.0045f,
-        0.00035f + 0.00060f * slope);
-
-    float2 texelPosition =
-        uv * float2(width, height) - 0.5f;
-    float2 interpolation = frac(texelPosition);
-    int2 basePixel = int2(floor(texelPosition));
-    float occlusion = 0.0f;
-    [unroll]
-    for (int y = {{SHADOW_MIN_OFFSET}}; y <= {{SHADOW_MAX_OFFSET}}; ++y)
-    {
-        [unroll]
-        for (int x = {{SHADOW_MIN_OFFSET}}; x <= {{SHADOW_MAX_OFFSET}}; ++x)
-        {
-            int2 pixel00 = clamp(
-                basePixel + int2(x, y),
-                int2(0, 0),
-                int2(width - 1, height - 1));
-            int2 pixel10 = clamp(
-                pixel00 + int2(1, 0),
-                int2(0, 0),
-                int2(width - 1, height - 1));
-            int2 pixel01 = clamp(
-                pixel00 + int2(0, 1),
-                int2(0, 0),
-                int2(width - 1, height - 1));
-            int2 pixel11 = clamp(
-                pixel00 + int2(1, 1),
-                int2(0, 0),
-                int2(width - 1, height - 1));
-            float comparisonDepth = projected.z - receiverBias;
-            float comparison00 = comparisonDepth >
-                ShadowMap.Load(int3(pixel00, 0)) ? 1.0f : 0.0f;
-            float comparison10 = comparisonDepth >
-                ShadowMap.Load(int3(pixel10, 0)) ? 1.0f : 0.0f;
-            float comparison01 = comparisonDepth >
-                ShadowMap.Load(int3(pixel01, 0)) ? 1.0f : 0.0f;
-            float comparison11 = comparisonDepth >
-                ShadowMap.Load(int3(pixel11, 0)) ? 1.0f : 0.0f;
-            float comparisonTop = lerp(
-                comparison00,
-                comparison10,
-                interpolation.x);
-            float comparisonBottom = lerp(
-                comparison01,
-                comparison11,
-                interpolation.x);
-            occlusion += lerp(
-                comparisonTop,
-                comparisonBottom,
-                interpolation.y);
-        }
-    }
-    return 1.0f - {{SHADOW_STRENGTH}}f * occlusion / {{SHADOW_SAMPLE_COUNT}}.0f;
-}
-
-float3 ResolveSurfaceNormal(VSOutput input, bool isFrontFace)
-{
-    float3 normal = NormalizeSafe(input.Normal, float3(0.0f, 1.0f, 0.0f));
-    if (!isFrontFace)
-    {
-        normal = -normal;
-    }
-    if (TextureFlags.y == 0)
-    {
-        return normal;
-    }
-
-    float3 positionDx = ddx(input.WorldPosition);
-    float3 positionDy = ddy(input.WorldPosition);
-    float2 texCoordDx = ddx(input.TexCoord);
-    float2 texCoordDy = ddy(input.TexCoord);
-    float determinant =
-        texCoordDx.x * texCoordDy.y -
-        texCoordDx.y * texCoordDy.x;
-    if (abs(determinant) < 1.0e-10f)
-    {
-        return normal;
-    }
-
-    float inverseDeterminant = rcp(determinant);
-    float3 tangent = (positionDx * texCoordDy.y -
-        positionDy * texCoordDx.y) * inverseDeterminant;
-    float3 sourceBitangent = (-positionDx * texCoordDy.x +
-        positionDy * texCoordDx.x) * inverseDeterminant;
-    tangent = tangent - normal * dot(normal, tangent);
-    float3 tangentHelper = abs(normal.y) < 0.999f
-        ? float3(0.0f, 1.0f, 0.0f)
-        : float3(1.0f, 0.0f, 0.0f);
-    float3 tangentFallback = NormalizeSafe(
-        cross(tangentHelper, normal),
-        float3(1.0f, 0.0f, 0.0f));
-    tangent = NormalizeSafe(tangent, tangentFallback);
-    float handedness = dot(cross(normal, tangent), sourceBitangent) < 0.0f
-        ? -1.0f
-        : 1.0f;
-    float3 bitangent = NormalizeSafe(
-        cross(normal, tangent) * handedness,
-        float3(0.0f, 0.0f, 1.0f));
-    float3 tangentNormal =
-        NormalMap.Sample(SurfaceSampler, input.TexCoord).xyz * 2.0f - 1.0f;
-    return NormalizeSafe(
-        tangent * tangentNormal.x +
-        bitangent * tangentNormal.y +
-        normal * tangentNormal.z,
-        normal);
-}
-
-void AccumulateLightSample(
-    float3 lightDirection,
-    float3 radiance,
-    float visibility,
-    float3 normal,
-    float3 viewDirection,
-    inout float3 diffuseLight,
-    inout float3 specularLight)
-{
-    float directionLengthSquared = dot(lightDirection, lightDirection);
-    if (directionLengthSquared <= 1.0e-12f)
-    {
-        return;
-    }
-    float3 direction = lightDirection * rsqrt(directionLengthSquared);
-    float normalToLight = max(dot(normal, direction), 0.0f);
-    if (normalToLight <= 0.0f)
-    {
-        return;
-    }
-    float3 visibleRadiance = radiance * visibility;
-    diffuseLight += visibleRadiance * normalToLight;
-    float3 halfVector = NormalizeSafe(
-        direction + viewDirection,
-        normal);
-    float specularAmount = pow(
-        max(dot(normal, halfVector), 0.0f),
-        max(MaterialParameters.x, 1.0f));
-    specularLight += visibleRadiance * specularAmount;
-}
-
-void AccumulateSceneLight(
-    uint lightIndex,
-    VSOutput input,
-    float3 normal,
-    float3 viewDirection,
-    inout float3 diffuseLight,
-    inout float3 specularLight)
-{
-    LightConstants light = Lights[lightIndex];
-    uint type = (uint)(light.PositionType.w + 0.5f);
-    float3 shadowDirection = type == 0
-        ? light.DirectionIntensity.xyz
-        : light.PositionType.xyz - input.WorldPosition;
-    bool isShadowLight =
-        int(lightIndex) == int(RenderParameters.z) &&
-        light.ColorCastShadows.w > 0.5f;
-    float visibility = isShadowLight
-        ? SampleShadow(
-            input.LightPosition,
-            normal,
-            shadowDirection)
-        : 1.0f;
-    float3 radiance =
-        max(light.ColorCastShadows.rgb, 0.0f) *
-        max(light.DirectionIntensity.w, 0.0f);
-
-    if (type == 0)
-    {
-        AccumulateLightSample(
-            light.DirectionIntensity.xyz,
-            radiance,
-            visibility,
-            normal,
-            viewDirection,
-            diffuseLight,
-            specularLight);
-        return;
-    }
-
-    if (type == 1)
-    {
-        float3 toLight = light.PositionType.xyz - input.WorldPosition;
-        float distanceSquared = max(dot(toLight, toLight), 1.0e-6f);
-        AccumulateLightSample(
-            toLight,
-            radiance / distanceSquared,
-            visibility,
-            normal,
-            viewDirection,
-            diffuseLight,
-            specularLight);
-        return;
-    }
-
-    float3 emissionDirection = NormalizeSafe(
-        light.DirectionIntensity.xyz,
-        float3(0.0f, -1.0f, 0.0f));
-    float3 helper = abs(emissionDirection.y) < 0.999f
-        ? float3(0.0f, 1.0f, 0.0f)
-        : float3(1.0f, 0.0f, 0.0f);
-    float3 tangent = NormalizeSafe(
-        cross(helper, emissionDirection),
-        float3(1.0f, 0.0f, 0.0f));
-    float3 bitangent = NormalizeSafe(
-        cross(emissionDirection, tangent),
-        float3(0.0f, 0.0f, 1.0f));
-    [unroll]
-    for (int sampleY = 0; sampleY < 2; ++sampleY)
-    {
-        [unroll]
-        for (int sampleX = 0; sampleX < 2; ++sampleX)
-        {
-            float offsetX = sampleX == 0 ? -0.25f : 0.25f;
-            float offsetY = sampleY == 0 ? -0.25f : 0.25f;
-            float3 samplePosition =
-                light.PositionType.xyz +
-                tangent * (offsetX * light.AreaSizePadding.x) +
-                bitangent * (offsetY * light.AreaSizePadding.y);
-            float3 toLight = samplePosition - input.WorldPosition;
-            float distanceSquared = max(dot(toLight, toLight), 1.0e-6f);
-            float3 direction = toLight * rsqrt(distanceSquared);
-            float emitterCosine = max(
-                dot(emissionDirection, -direction),
-                0.0f);
-            AccumulateLightSample(
-                direction,
-                radiance * (0.25f * emitterCosine / distanceSquared),
-                visibility,
-                normal,
-                viewDirection,
-                diffuseLight,
-                specularLight);
-        }
-    }
-}
-
-float4 {{FRAGMENT_ENTRY}}(
-    VSOutput input,
-    bool isFrontFace : SV_IsFrontFace) : SV_TARGET
-{
-    float4 diffuseSample = SampleDiffuse(input.TexCoord);
-    float alpha = SurfaceAlpha(input, diffuseSample);
-    ApplyAlphaClip(alpha);
-    if (RenderParameters.y > 0.5f)
-    {
-        return float4(
-            SRGBToLinear(saturate(PipelineColor.rgb)),
-            alpha);
-    }
-
-    float3 surfaceBase =
-        input.Color.rgb *
-        max(PipelineColor.rgb, 0.0f) *
-        max(diffuseSample.rgb, 0.0f);
-    float3 normal = ResolveSurfaceNormal(input, isFrontFace);
-    float3 viewDirection = NormalizeSafe(
-        CameraLightCount.xyz - input.WorldPosition,
-        normal);
-    float3 diffuseLight = 0.0f;
-    float3 specularLight = 0.0f;
-    uint lightCount = min((uint)(CameraLightCount.w + 0.5f), 4u);
-    [loop]
-    for (uint lightIndex = 0; lightIndex < lightCount; ++lightIndex)
-    {
-        AccumulateSceneLight(
-            lightIndex,
-            input,
-            normal,
-            viewDirection,
-            diffuseLight,
-            specularLight);
-    }
-
-    float3 color =
-        surfaceBase *
-            max(MaterialAmbientColor.rgb, 0.0f) *
-                max(AmbientColorStrength.rgb, 0.0f) *
-                max(AmbientColorStrength.w, 0.0f) +
-        surfaceBase *
-            max(MaterialDiffuseColor.rgb, 0.0f) *
-            diffuseLight +
-        max(MaterialSpecularColor.rgb, 0.0f) * specularLight +
-        max(MaterialEmissiveColor.rgb, 0.0f);
-    return float4(PrepareDisplayLinear(color), alpha);
-}
-
-void {{SHADOW_ENTRY}}(VSOutput input)
-{
-    float4 diffuseSample = SampleDiffuse(input.TexCoord);
-    ApplyShadowAlpha(SurfaceAlpha(input, diffuseSample), input.Position.xy);
-}
-
-float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
-{
-    float4 diffuseSample = SampleDiffuse(input.TexCoord);
-    ApplyAlphaClip(SurfaceAlpha(input, diffuseSample));
-    uint radius = (uint)round(clamp(
-        MaterialParameters.w,
-        0.0f,
-        255.0f));
-    uint opacity = (uint)round(
-        saturate(PipelineColor.a) * 255.0f);
-    uint packedOutline = (radius << 8) | opacity;
-    return float4(
-        saturate(PipelineColor.rgb),
-        (float)packedOutline / 65535.0f);
-}
-)";
 
 		std::string HResultMessage(const char* operation, HRESULT result)
 		{
@@ -669,32 +180,6 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 			return true;
 		}
 
-		bool CompileShader(const char* entryPoint, const char* target, ComPtr<ID3DBlob>& bytecode)
-		{
-			UINT flags = D3DCOMPILE_ENABLE_STRICTNESS;
-#if defined(_DEBUG)
-			flags |= D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION;
-#else
-			flags |= D3DCOMPILE_OPTIMIZATION_LEVEL3;
-#endif
-			ComPtr<ID3DBlob> errors;
-			const HRESULT result = D3DCompile(ShaderCode.data(), ShaderCode.size(), "ArvoDX11.hlsl",
-				nullptr, nullptr, entryPoint, target, flags, 0, bytecode.GetAddressOf(), errors.GetAddressOf());
-			if (FAILED(result))
-			{
-				if (errors)
-				{
-					LastError.assign(static_cast<const char*>(errors->GetBufferPointer()), errors->GetBufferSize());
-				}
-				else
-				{
-					LastError = HResultMessage("D3DCompile", result);
-				}
-				return false;
-			}
-			return true;
-		}
-
 		bool CreateDepthTexture(int width, int height, bool shaderResource,
 			ComPtr<ID3D11Texture2D>& texture, ComPtr<ID3D11DepthStencilView>& depthView,
 			ComPtr<ID3D11ShaderResourceView>& shaderView, ComPtr<ID3D11Texture2D>& staging)
@@ -804,54 +289,19 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 
 		bool CreatePipelineObjects()
 		{
-			if (!PrepareBuiltinRealtimeShader(
-					RealtimeShaderLanguage::HLSL,
-					ShaderSourceTemplate,
-					{
-						RealtimeShaderStage::Vertex,
-						RealtimeShaderStage::Fragment,
-						RealtimeShaderStage::Shadow,
-						RealtimeShaderStage::Outline },
-					sizeof(DrawConstants),
-					MaximumSceneLights,
-					ShaderCode,
-					LastError))
-			{
-				return false;
-			}
-			const RealtimeShaderProgram& shader =
-				BuiltinRealtimeShader().Program;
-			ComPtr<ID3DBlob> vertexBytecode;
-			ComPtr<ID3DBlob> pixelBytecode;
-			ComPtr<ID3DBlob> shadowPixelBytecode;
-			ComPtr<ID3DBlob> outlinePixelBytecode;
-			if (!CompileShader(
-					shader.FindStage(RealtimeShaderStage::Vertex)->HLSL.c_str(),
-					"vs_5_0",
-					vertexBytecode)
-				|| !CompileShader(
-					shader.FindStage(RealtimeShaderStage::Fragment)->HLSL.c_str(),
-					"ps_5_0",
-					pixelBytecode)
-				|| !CompileShader(
-					shader.FindStage(RealtimeShaderStage::Shadow)->HLSL.c_str(),
-					"ps_5_0",
-					shadowPixelBytecode)
-				|| !CompileShader(
-					shader.FindStage(RealtimeShaderStage::Outline)->HLSL.c_str(),
-					"ps_5_0",
-					outlinePixelBytecode)) return false;
-			HRESULT result = Device->CreateVertexShader(vertexBytecode->GetBufferPointer(),
-				vertexBytecode->GetBufferSize(), nullptr, VertexShader.GetAddressOf());
+			// Build-time bytecode retains the full DX11 shading model and avoids
+			// repeating FXC optimization when the editor creates a preview device.
+			HRESULT result = Device->CreateVertexShader(DX11Shaders::Vertex,
+				std::size(DX11Shaders::Vertex), nullptr, VertexShader.GetAddressOf());
 			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreateVertexShader", result));
-			result = Device->CreatePixelShader(pixelBytecode->GetBufferPointer(),
-				pixelBytecode->GetBufferSize(), nullptr, PixelShader.GetAddressOf());
+			result = Device->CreatePixelShader(DX11Shaders::Fragment,
+				std::size(DX11Shaders::Fragment), nullptr, PixelShader.GetAddressOf());
 			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreatePixelShader", result));
-			result = Device->CreatePixelShader(shadowPixelBytecode->GetBufferPointer(),
-				shadowPixelBytecode->GetBufferSize(), nullptr, ShadowPixelShader.GetAddressOf());
+			result = Device->CreatePixelShader(DX11Shaders::Shadow,
+				std::size(DX11Shaders::Shadow), nullptr, ShadowPixelShader.GetAddressOf());
 			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreatePixelShader(shadow)", result));
-			result = Device->CreatePixelShader(outlinePixelBytecode->GetBufferPointer(),
-				outlinePixelBytecode->GetBufferSize(), nullptr, OutlinePixelShader.GetAddressOf());
+			result = Device->CreatePixelShader(DX11Shaders::Outline,
+				std::size(DX11Shaders::Outline), nullptr, OutlinePixelShader.GetAddressOf());
 			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreatePixelShader(outline)", result));
 
 			const D3D11_INPUT_ELEMENT_DESC inputElements[] = {
@@ -860,8 +310,8 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 				{ "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 24, D3D11_INPUT_PER_VERTEX_DATA, 0 },
 				{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 40, D3D11_INPUT_PER_VERTEX_DATA, 0 }
 			};
-			result = Device->CreateInputLayout(inputElements, 4, vertexBytecode->GetBufferPointer(),
-				vertexBytecode->GetBufferSize(), InputLayout.GetAddressOf());
+			result = Device->CreateInputLayout(inputElements, 4, DX11Shaders::Vertex,
+				std::size(DX11Shaders::Vertex), InputLayout.GetAddressOf());
 			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreateInputLayout", result));
 
 			D3D11_BUFFER_DESC constantDesc = {};
@@ -871,6 +321,12 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 			constantDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
 			result = Device->CreateBuffer(&constantDesc, nullptr, ConstantBuffer.GetAddressOf());
 			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreateBuffer(constants)", result));
+			constantDesc.ByteWidth = sizeof(DX11PhysicalConstants);
+			result = Device->CreateBuffer(&constantDesc, nullptr, PhysicalConstantBuffer.GetAddressOf());
+			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreateBuffer(physical constants)", result));
+			constantDesc.ByteWidth = sizeof(DX11MediumConstants);
+			result = Device->CreateBuffer(&constantDesc, nullptr, MediumConstantBuffer.GetAddressOf());
+			if (FAILED(result)) return Fail(HResultMessage("ID3D11Device::CreateBuffer(medium constants)", result));
 
 			D3D11_RASTERIZER_DESC rasterDesc = {};
 			rasterDesc.FillMode = D3D11_FILL_SOLID;
@@ -1181,6 +637,7 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 		RHICreateInfo CreateInfo;
 		ComPtr<ID3D11Device> Device;
 		ComPtr<ID3D11DeviceContext> Context;
+		std::unique_ptr<DX11MicropolygonDicer> MicropolygonDicer;
 		D3D_FEATURE_LEVEL FeatureLevel = D3D_FEATURE_LEVEL_11_0;
 		D3D_DRIVER_TYPE DriverType = D3D_DRIVER_TYPE_UNKNOWN;
 		ComPtr<ID3D11Texture2D> ColorTexture;
@@ -1198,6 +655,8 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 		ComPtr<ID3D11PixelShader> OutlinePixelShader;
 		ComPtr<ID3D11InputLayout> InputLayout;
 		ComPtr<ID3D11Buffer> ConstantBuffer;
+		ComPtr<ID3D11Buffer> PhysicalConstantBuffer;
+		ComPtr<ID3D11Buffer> MediumConstantBuffer;
 		ComPtr<ID3D11RasterizerState> SolidRasterState;
 		ComPtr<ID3D11RasterizerState> ShadowRasterState;
 		ComPtr<ID3D11RasterizerState> WireRasterState;
@@ -1220,7 +679,6 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 		BufferHandle BoundVertexBuffer;
 		BufferHandle BoundIndexBuffer;
 		TextureHandle LastShadowTexture;
-		std::string ShaderCode;
 		std::string LastError;
 		std::thread::id OwnerThread;
 		std::uint32_t NextBuffer = 0x11000001u;
@@ -1302,6 +760,7 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 	{
 		if (!m_Impl) return;
 		if (m_Impl->Context) m_Impl->Context->ClearState();
+		m_Impl->MicropolygonDicer.reset();
 		m_Impl->Buffers.clear();
 		m_Impl->Textures.clear();
 		m_Impl->ColorTexture.Reset();
@@ -1319,6 +778,8 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 		m_Impl->OutlinePixelShader.Reset();
 		m_Impl->InputLayout.Reset();
 		m_Impl->ConstantBuffer.Reset();
+		m_Impl->PhysicalConstantBuffer.Reset();
+		m_Impl->MediumConstantBuffer.Reset();
 		m_Impl->SolidRasterState.Reset();
 		m_Impl->ShadowRasterState.Reset();
 		m_Impl->WireRasterState.Reset();
@@ -1339,6 +800,27 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 		m_Impl->OwnerThread = {};
 	}
 
+	RayTracing::MicropolygonResult DX11RHI::PrepareMicropolygons(const RayTracing::Scene& scene,
+																 const RayTracing::Camera& camera,
+																 const RayTracing::RenderSettings& settings,
+																 const RayTracing::CancellationToken& token)
+	{
+		RayTracing::MicropolygonResult result;
+		if (!m_Impl->CheckThread("PrepareMicropolygons"))
+		{
+			result.Error = m_Impl->LastError;
+			return result;
+		}
+		if (m_Impl->FrameOpen)
+		{
+			result.Error = "DX11 geometry preparation must precede raster passes";
+			return result;
+		}
+		if (!m_Impl->MicropolygonDicer)
+			m_Impl->MicropolygonDicer =
+				std::make_unique<DX11MicropolygonDicer>(m_Impl->Device.Get(), m_Impl->Context.Get());
+		return m_Impl->MicropolygonDicer->Prepare(scene, camera, settings, token);
+	}
 	bool DX11RHI::IsInitialized() const { return m_Impl->Initialized; }
 	RHIBackend DX11RHI::GetBackend() const { return RHIBackend::DX11; }
 	const char* DX11RHI::GetName() const { return "DirectX 11 Native RHI"; }
@@ -1669,6 +1151,13 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 	{
 		if (!m_Impl->CheckThread("BindPipeline") || !m_Impl->PassOpen)
 			return m_Impl->Fail("DX11 pipeline must be bound inside a pass");
+		std::string materialError;
+		if (!RayTracing::ValidateMaterialScattering(pipeline.Scattering, materialError))
+			return m_Impl->Fail(materialError);
+		if (!RayTracing::ValidateMediumOptions(RayTracing::Algorithm::PathTracing, pipeline.Medium, materialError))
+			return m_Impl->Fail(materialError);
+		if (pipeline.MediumBackground && (!pipeline.Medium.Enabled || m_Impl->CurrentPass.Type != PassType::Color))
+			return m_Impl->Fail("Medium background requires an enabled medium in a color pass");
 		m_Impl->BoundPipeline = pipeline;
 		m_Impl->PipelineBound = true;
 		return true;
@@ -1875,6 +1364,18 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 		if (FAILED(result)) return m_Impl->Fail(HResultMessage("ID3D11DeviceContext::Map(constants)", result));
 		std::memcpy(mapped.pData, &constants, sizeof(constants));
 		m_Impl->Context->Unmap(m_Impl->ConstantBuffer.Get(), 0);
+		const auto physical = BuildDX11PhysicalConstants(m_Impl->BoundPipeline);
+		result = m_Impl->Context->Map(m_Impl->PhysicalConstantBuffer.Get(), 0,
+			D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(result)) return m_Impl->Fail(HResultMessage("ID3D11DeviceContext::Map(physical constants)", result));
+		std::memcpy(mapped.pData, &physical, sizeof(physical));
+		m_Impl->Context->Unmap(m_Impl->PhysicalConstantBuffer.Get(), 0);
+		const auto medium = BuildDX11MediumConstants(m_Impl->BoundPipeline);
+		result = m_Impl->Context->Map(m_Impl->MediumConstantBuffer.Get(), 0,
+			D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+		if (FAILED(result)) return m_Impl->Fail(HResultMessage("ID3D11DeviceContext::Map(medium constants)", result));
+		std::memcpy(mapped.pData, &medium, sizeof(medium));
+		m_Impl->Context->Unmap(m_Impl->MediumConstantBuffer.Get(), 0);
 
 		const UINT stride = sizeof(Vertex);
 		const UINT offset = 0;
@@ -1887,6 +1388,11 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 		ID3D11Buffer* constantBuffer = m_Impl->ConstantBuffer.Get();
 		m_Impl->Context->VSSetConstantBuffers(0, 1, &constantBuffer);
 		m_Impl->Context->PSSetConstantBuffers(0, 1, &constantBuffer);
+		ID3D11Buffer* physicalBuffer = m_Impl->PhysicalConstantBuffer.Get();
+		m_Impl->Context->PSSetConstantBuffers(DX11PhysicalConstantSlot, 1, &physicalBuffer);
+		ID3D11Buffer* mediumBuffer = m_Impl->MediumConstantBuffer.Get();
+		m_Impl->Context->VSSetConstantBuffers(DX11MediumConstantSlot, 1, &mediumBuffer);
+		m_Impl->Context->PSSetConstantBuffers(DX11MediumConstantSlot, 1, &mediumBuffer);
 		ID3D11PixelShader* pixelShader = m_Impl->PixelShader.Get();
 		if (m_Impl->CurrentPass.Type == PassType::Shadow)
 		{
@@ -2009,6 +1515,18 @@ float4 {{OUTLINE_ENTRY}}(VSOutput input) : SV_TARGET
 	bool DX11RHI::Initialize(const RHICreateInfo&) { return false; }
 	void DX11RHI::Shutdown() {}
 	bool DX11RHI::IsInitialized() const { return false; }
+	RayTracing::MicropolygonResult DX11RHI::PrepareMicropolygons(const RayTracing::Scene&,
+																 const RayTracing::Camera&,
+																 const RayTracing::RenderSettings&,
+																 const RayTracing::CancellationToken& token)
+	{
+		RayTracing::MicropolygonResult result;
+		if (token.IsCancellationRequested())
+			result.Status = RayTracing::RenderStatus::Cancelled;
+		else
+			result.Error = "DX11 micropolygons require Windows";
+		return result;
+	}
 	RHIBackend DX11RHI::GetBackend() const { return RHIBackend::DX11; }
 	const char* DX11RHI::GetName() const { return "DirectX 11 Unavailable"; }
 	RHICapabilities DX11RHI::GetCapabilities() const { return {}; }

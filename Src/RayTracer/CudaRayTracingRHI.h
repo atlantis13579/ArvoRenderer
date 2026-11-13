@@ -13,6 +13,17 @@ namespace RayTracing
         ~CudaRayTracingRHI() override;
 
         BackendInfo GetBackendInfo() const override;
+        MicropolygonResult PrepareMicropolygons(const Scene&, const Camera&, const RenderSettings&,
+            const CancellationToken& = CancellationToken()) const override;
+        TemporalResult ReconstructTemporal(const TemporalFrame&, const TemporalHistory*,
+                                           const TemporalOptions&,
+                                           const CancellationToken& = CancellationToken()) const override;
+        GeometryGuideResult CaptureGeometryGuides(
+            const Scene&, const Camera&, const RenderSettings&,
+            const CancellationToken& = CancellationToken()) const override;
+        RayQueryResult QueryRays(const Scene& scene, const std::vector<Ray>& rays,
+            AccelerationOptions acceleration = AccelerationType::Bvh,
+            const CancellationToken& cancellation = CancellationToken()) const override;
         RenderResult Render(
             const Scene& scene,
             const Camera& camera,

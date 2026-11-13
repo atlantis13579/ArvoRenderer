@@ -1,4 +1,6 @@
 #include "Editor/Editor.hpp"
+#include "Editor/ModuleAdapters.h"
+#include "Renderer/Reconstruction.h"
 
 #include <algorithm>
 #include <cctype>
@@ -82,6 +84,7 @@ void Translate(Float3& value, const Float3& offset)
 EditorCore::EditorCore(std::filesystem::path contentRoot)
     : Demos_(std::move(contentRoot)), Scene_(Demos_.Load(DemoId::CornellBox))
 {
+    Scene_.Revision = ++SceneRevision_;
 }
 
 EditorCore::~EditorCore()
@@ -121,6 +124,10 @@ void EditorCore::RegisterRenderAdapter(std::shared_ptr<IRenderAdapter> adapter)
         throw std::invalid_argument("Cannot register a null render adapter");
     }
     const BackendDescriptor descriptor = adapter->Descriptor();
+    if (!descriptor.SupportsPreview())
+    {
+        throw std::invalid_argument("Offline-only backends belong in worker selection, not realtime preview");
+    }
     if (descriptor.Id.empty())
     {
         throw std::invalid_argument("A render adapter must have a stable identifier");
@@ -178,7 +185,10 @@ void EditorCore::SelectBackend(const std::string& backendId)
     {
         return;
     }
+    if (auto previous = FindAdapter(SelectedBackend_)) previous->ResetTemporalHistory();
     SelectedBackend_ = canonicalBackend;
+    if (auto selected = FindAdapter(SelectedBackend_)) selected->ResetTemporalHistory();
+    if (!FindDescriptor(SelectedBackend_).TransportBackend) Settings_.TemporalPreview = false;
     InvalidateAndRender();
 }
 
@@ -209,12 +219,162 @@ void EditorCore::SetOutlineEnabled(bool enabled)
     }
 }
 
-void EditorCore::SetPreviewIntegrator(bool pathTracing, std::uint32_t samples, std::uint32_t bounces)
+void EditorCore::SetMaterialScattering(std::size_t index, const RayTracing::MaterialScattering& scattering)
 {
-    if (Settings_.PathTracing == pathTracing && Settings_.PreviewSamples == samples && Settings_.MaxBounces == bounces) return;
-    Settings_.PathTracing = pathTracing;
-    Settings_.PreviewSamples = std::clamp(samples, 1U, 64U);
-    Settings_.MaxBounces = std::clamp(bounces, 1U, 16U);
+    if (ActiveDemoLoad_) throw std::runtime_error("Wait for scene loading before editing materials");
+    if (index >= Scene_.Materials.size()) throw std::out_of_range("Unknown scene material");
+    std::string error;
+    if (!RayTracing::ValidateMaterialScattering(scattering, error)) throw std::invalid_argument(error);
+    if (Scene_.Materials[index].Scattering == scattering) return;
+    Scene_.Materials[index].Scattering = scattering;
+    Scene_.Revision = ++SceneRevision_;
+    InvalidateAndRender();
+}
+
+void EditorCore::SetSceneMaterialModel(RayTracing::MaterialModel model)
+{
+    if (ActiveDemoLoad_) throw std::runtime_error("Wait for scene loading before editing materials");
+    std::string error;
+    bool changed = false;
+    for (const auto& material : Scene_.Materials)
+    {
+        auto scattering = material.Scattering;
+        scattering.Model = model;
+        if (!RayTracing::ValidateMaterialScattering(scattering, error)) throw std::invalid_argument(error);
+        changed |= material.Scattering.Model != model;
+    }
+    if (!changed) return;
+    for (auto& material : Scene_.Materials) material.Scattering.Model = model;
+    Scene_.Revision = ++SceneRevision_;
+    InvalidateAndRender();
+}
+
+void EditorCore::SetCameraLens(const RayTracing::CameraLens& lens)
+{
+    if (ActiveDemoLoad_) throw std::runtime_error("Wait for scene loading before editing the camera");
+    std::string error;
+    if (!RayTracing::ValidateCameraLens(lens, error)) throw std::invalid_argument(error);
+    if (Scene_.SceneCamera.Lens == lens) return;
+    Scene_.SceneCamera.Lens = lens;
+    if (lens.Radius > 0)
+    {
+        Settings_.TemporalPreview = false;
+        Settings_.Reconstruction.GeometryGuidance = false;
+    }
+    ++Scene_.CameraRevision;
+    InvalidateAndRender();
+}
+
+void EditorCore::SetCameraMotion(const RayTracing::MotionData::Exposure& motion)
+{
+    if (ActiveDemoLoad_)
+        throw std::runtime_error("Wait for scene loading before editing the camera");
+    std::string error;
+    if (!RayTracing::ValidateCameraMotion(motion, error))
+        throw std::invalid_argument(error);
+    if (Scene_.SceneCamera.Motion == motion)
+        return;
+    Scene_.SceneCamera.Motion = motion;
+    if (motion.Enabled)
+    {
+        Settings_.TemporalPreview = false;
+        Settings_.Reconstruction.GeometryGuidance = false;
+    }
+    ++Scene_.CameraRevision;
+    InvalidateAndRender();
+}
+
+void EditorCore::SetTemporalPreview(bool enabled, const RayTracing::TemporalOptions& options)
+{
+    std::string error;
+    if (!RayTracing::ValidateTemporalOptions(options, error)) throw std::invalid_argument(error);
+    if (enabled && (!FindDescriptor(SelectedBackend_).TransportBackend ||
+                    Scene_.SceneCamera.Lens.Radius != 0 || Scene_.SceneCamera.Motion.Enabled || HasObjectMotion(Scene_) ||
+                    Settings_.Reconstruction.Filter != RayTracing::ReconstructionFilter::None ||
+                    Settings_.Medium.Enabled))
+        throw std::invalid_argument("Temporal preview requires a stationary pinhole ray-traced view without object motion, spatial filtering or participating media");
+    if (Settings_.TemporalPreview == enabled && Settings_.Temporal == options) return;
+    Settings_.TemporalPreview = enabled;
+    Settings_.Temporal = options;
+    if (auto adapter = FindAdapter(SelectedBackend_)) adapter->ResetTemporalHistory();
+    InvalidateAndRender();
+}
+
+void EditorCore::SetMicropolygons(const RayTracing::MicropolygonOptions& options)
+{
+    std::string error;
+    if (!RayTracing::ValidateMicropolygonOptions(options, error))
+        throw std::invalid_argument(error);
+    if (Settings_.Micropolygons == options)
+        return;
+    Settings_.Micropolygons = options;
+    InvalidateAndRender();
+}
+
+void EditorCore::SetPreviewIntegrator(
+    RayTracing::Algorithm integrator, std::uint32_t samples, std::uint32_t bounces,
+    RayTracing::TransportOptions transport, RayTracing::SampleSequence sampling,
+    RayTracing::AdaptiveOptions adaptive, RayTracing::AccelerationType acceleration,
+    RayTracing::BvhBuildPolicy bvhPolicy, RayTracing::GeometryMode geometry,
+    RayTracing::MetropolisOptions metropolis, RayTracing::PhotonMappingOptions photons,
+    RayTracing::ProgressivePhotonOptions progressivePhotons, RayTracing::VertexConnectionMergingOptions vcm,
+    RayTracing::PointGiOptions pointGi, RayTracing::ReconstructionOptions reconstruction, uint32_t samplingSeed,
+    RayTracing::MediumOptions medium, RayTracing::RadiometryMode radiometry)
+{
+    samples = std::clamp(samples, 1U, 64U);
+    bounces = std::clamp(bounces, 1U, 16U);
+    std::string error;
+    if (!RayTracing::ValidateTransportOptions(integrator, transport, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidateCameraMotionSupport(integrator, Scene_.SceneCamera.Motion, error))
+        throw std::invalid_argument(error);
+    if (HasObjectMotion(Scene_) && (!RayTracing::SupportsMotionBlur(integrator) || geometry != RayTracing::GeometryMode::Instanced))
+        throw std::invalid_argument("Object motion requires Path or Distributed Ray Tracing and instanced geometry");
+    if (!RayTracing::ValidateRadiometry(integrator, radiometry, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidateAdaptiveOptions(integrator, adaptive, samples, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidateMediumOptions(integrator, medium, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidateMetropolisOptions(metropolis, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidatePhotonMappingOptions(photons, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidateProgressivePhotonOptions(progressivePhotons, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidateVertexConnectionMergingOptions(vcm, error))
+        throw std::invalid_argument(error);
+    if (!RayTracing::ValidatePointGiOptions(pointGi, error)) throw std::invalid_argument(error);
+    if (!RayTracing::ValidateReconstructionSupport(BuildOfflineCamera(Scene_), HasObjectMotion(Scene_),
+                                                   reconstruction, medium, error))
+        throw std::invalid_argument(error);
+    if (adaptive.DenoiserAware && reconstruction.Filter != RayTracing::ReconstructionFilter::SpatialAtrous)
+        throw std::invalid_argument("Denoiser-aware allocation requires spatial reconstruction");
+    if (integrator == RayTracing::Algorithm::MetropolisLightTransport && sampling != RayTracing::SampleSequence::Independent)
+        throw std::invalid_argument("MLT requires independent primary samples");
+    if (!RayTracing::ValidateAcceleration({acceleration, bvhPolicy}, error)) throw std::invalid_argument(error);
+    if (!RayTracing::FindSampler(sampling)) throw std::invalid_argument("Unknown sampling sequence");
+    if (!RayTracing::GeometryModeKey(geometry)) throw std::invalid_argument("Unknown geometry mode");
+    if (Settings_.Integrator == integrator && Settings_.Radiometry == radiometry && Settings_.PreviewSamples == samples &&
+        Settings_.MaxBounces == bounces && Settings_.Transport == transport &&
+        Settings_.Sampling == sampling && Settings_.SamplingSeed == samplingSeed && Settings_.Adaptive == adaptive &&
+        Settings_.Acceleration == acceleration && Settings_.BvhPolicy == bvhPolicy &&
+        Settings_.Geometry == geometry && Settings_.Metropolis == metropolis &&
+        Settings_.Photons == photons && Settings_.ProgressivePhotons == progressivePhotons &&
+        Settings_.Vcm == vcm && Settings_.PointGi == pointGi && Settings_.Reconstruction == reconstruction && Settings_.Medium == medium)
+        return;
+    Settings_.Integrator = integrator;
+    Settings_.Radiometry = radiometry;
+    Settings_.Transport = transport;
+    Settings_.Sampling = sampling;
+    Settings_.SamplingSeed = samplingSeed;
+    Settings_.Adaptive = adaptive;
+    Settings_.Medium = medium;
+    Settings_.Metropolis = metropolis;
+    Settings_.Photons = photons;
+    Settings_.ProgressivePhotons = progressivePhotons;
+    Settings_.Vcm = vcm;
+    Settings_.PointGi = pointGi;
+    Settings_.Reconstruction = reconstruction;
+    if (reconstruction.Filter != RayTracing::ReconstructionFilter::None || medium.Enabled) Settings_.TemporalPreview = false;
+    Settings_.Acceleration = acceleration;
+    Settings_.BvhPolicy = bvhPolicy;
+    Settings_.Geometry = geometry;
+    Settings_.PreviewSamples = samples;
+    Settings_.MaxBounces = bounces;
     InvalidateAndRender();
 }
 
@@ -478,14 +638,14 @@ std::vector<BackendDescriptor> EditorCore::Backends() const
     for (const BackendDescriptor& descriptor : catalog)
     {
         const auto adapter = Adapters_.find(descriptor.Id);
-        if (adapter != Adapters_.end() && adapter->second->IsAvailable())
+        if (descriptor.SupportsPreview() && adapter != Adapters_.end() && adapter->second->IsAvailable())
         {
             result.push_back(adapter->second->Descriptor());
         }
     }
     for (const auto& [id, adapter] : Adapters_)
     {
-        if (!adapter->IsAvailable())
+        if (!adapter->Descriptor().SupportsPreview() || !adapter->IsAvailable())
         {
             continue;
         }
@@ -546,10 +706,33 @@ void EditorCore::StartRender()
     const std::shared_ptr<IRenderAdapter> adapter = FindAdapter(SelectedBackend_);
     if (!adapter)
     {
-        StatusText_ = "No adapter registered for " + FindDescriptor(SelectedBackend_).DisplayName;
+        StatusText_ = "No realtime preview is available; offline workers remain available";
         return;
     }
     const BackendDescriptor descriptor = adapter->Descriptor();
+    if (Scene_.SceneCamera.Lens.Radius > 0 && !descriptor.TransportBackend)
+    {
+        StatusText_ = "Depth of field requires a ray-traced preview";
+        return;
+    }
+    for (const auto& material : Scene_.Materials)
+    {
+        if (material.Scattering.Model == RayTracing::MaterialModel::Legacy) continue;
+        if (!descriptor.TransportBackend)
+        {
+            if (descriptor.Id == "renderer.dx11") continue;
+            StatusText_ = "Physical materials require DX11 or a ray-traced preview";
+            return;
+        }
+        std::string error;
+        if (!RayTracing::ValidateMaterialSupport(material.Scattering, *descriptor.TransportBackend,
+                                                descriptor.Id == "renderer.dxr"
+                                                    ? RayTracing::Algorithm::PathTracing : Settings_.Integrator, error))
+        {
+            StatusText_ = material.Name + ": " + error;
+            return;
+        }
+    }
     if (HasBlockingRetiredRenderJob(SelectedBackend_, descriptor.Domain))
     {
         RenderDirty_ = true;
@@ -675,7 +858,9 @@ void EditorCore::CollectRetiredJobs()
     }
     if (!ActiveJob_ && RenderDirty_ && HasLoadedSelectedDemo())
     {
-        const RenderDomain selectedDomain = FindDescriptor(SelectedBackend_).Domain;
+        const auto selectedAdapter = FindAdapter(SelectedBackend_);
+        const RenderDomain selectedDomain = selectedAdapter ? selectedAdapter->Descriptor().Domain
+                                                           : RenderDomain::RealtimeRenderer;
         if (!HasBlockingRetiredRenderJob(SelectedBackend_, selectedDomain))
         {
             RenderDirty_ = false;
@@ -775,6 +960,7 @@ void EditorCore::CollectFinishedDemoLoad()
     }
 
     Scene_ = std::move(result.Scene);
+    Scene_.Revision = ++SceneRevision_;
     AppliedDemoRequest_ = DemoRequest_;
     Settings_.SelectedNode = 0;
     PendingRenderAfterLoad_ = false;
@@ -856,16 +1042,44 @@ void EditorCore::ApplyResult(
     switch (result.Status)
     {
     case RenderStatus::Completed:
+    {
         if (!result.Output.IsValid())
         {
             StatusText_ = "Renderer returned an invalid image";
             return;
         }
+        // Allocate labels before committing adapter state. After acceptance,
+        // publishing the image and its labels consists only of noexcept moves.
+        std::string acceptedBackend = backendId;
+        std::string acceptedStatus = "Frame completed with " + FindDescriptor(backendId).DisplayName;
+        if (result.Accept)
+        {
+            try
+            {
+                if (!result.Accept())
+                {
+                    StatusText_ = "Superseded temporal frame discarded";
+                    return;
+                }
+            }
+            catch (const std::exception& error)
+            {
+                StatusText_ = std::string("Frame acceptance failed: ") + error.what();
+                return;
+            }
+            catch (...)
+            {
+                StatusText_ = "Frame acceptance failed: unknown exception";
+                return;
+            }
+        }
         ViewportImage_ = std::move(result.Output);
-        ViewportBackend_ = backendId;
+        ViewportBackend_ = std::move(acceptedBackend);
         ++ViewportRevision_;
-        StatusText_ = "Frame completed with " + FindDescriptor(backendId).DisplayName;
+        RenderDirty_ = RenderDirty_ || result.ContinueRendering;
+        StatusText_ = std::move(acceptedStatus);
         break;
+    }
     case RenderStatus::Cancelled:
         StatusText_ = "Render cancelled";
         break;

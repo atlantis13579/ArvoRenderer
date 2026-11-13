@@ -42,6 +42,7 @@ namespace Arvo::Renderer
 		bool AreShadowsEnabled() const;
 		void SetLighting(const LightingState& lighting);
 		const LightingState& GetLighting() const;
+		bool SetMedium(const RayTracing::MediumOptions& medium);
 		void SetViewProjection(const Matrix4& viewProjection);
 		void SetLightViewProjection(const Matrix4& lightViewProjection);
 		void SetAutomaticViewProjection(bool enabled);
@@ -117,6 +118,7 @@ namespace Arvo::Renderer
 			PipelineState& pipeline) const;
 		bool RenderShadowPass();
 		bool RenderColorPass();
+		bool RenderMediumBackground();
 		bool RenderOutlinePass();
 		bool DrawMesh(const MeshResource& mesh, const PipelineState& pipeline);
 		void ApplyOutlines(FrameCapture& capture) const;
@@ -134,6 +136,8 @@ namespace Arvo::Renderer
 		Matrix4 m_ViewProjection;
 		Matrix4 m_LightViewProjection;
 		LightingState m_Lighting;
+		RayTracing::MediumOptions m_Medium;
+		MeshResource m_MediumBackground;
 		FrameCapture m_LastFrameCapture;
 		PassType m_CurrentPass = PassType::Color;
 		RenderMode m_RenderMode = RenderMode::Solid;

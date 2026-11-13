@@ -19,9 +19,8 @@ namespace RayTracing
         case BackendType::CPU:
             return std::make_shared<CpuRayTracingRHI>();
         case BackendType::DXR:
-            // Compatibility path. New realtime callers should construct the
-            // renderer-owned DXR backend directly.
-            return std::make_shared<DxrRayTracingRHI>();
+            // Offline jobs and the viewport share the same implementation and HLSL.
+            return Renderer::CreateDxrRHI();
         case BackendType::CUDA:
             return std::make_shared<CudaRayTracingRHI>();
         case BackendType::ComputeShader:

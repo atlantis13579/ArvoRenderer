@@ -1,5 +1,8 @@
 #pragma once
 
+#include "Renderer/RayTracing.h"
+#include "Renderer/TemporalReconstruction.h"
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -89,10 +92,13 @@ struct ImageAsset
 struct Material
 {
     std::string Name;
+    RayTracing::MaterialScattering Scattering;
     Color Ambient{0.0f, 0.0f, 0.0f, 1.0f};
     Color Diffuse;
     Color Specular{0.0f, 0.0f, 0.0f, 1.0f};
     Color Emissive{0.0f, 0.0f, 0.0f, 1.0f};
+    // An explicit area light samples this same emitting surface.
+    bool SampledEmitter = false;
     float Shininess = 0.0f;
     float Opacity = 1.0f;
     std::string DiffuseTexture;
@@ -113,6 +119,7 @@ struct SceneNode
     std::shared_ptr<const MeshAsset> Mesh;
     bool Visible = true;
     bool Selectable = true;
+    RayTracing::MotionData::RigidMotion Motion;
 };
 
 struct Camera
@@ -121,6 +128,8 @@ struct Camera
     Float3 Target{0.0f, 0.5f, 0.0f};
     Float3 Up{0.0f, 1.0f, 0.0f};
     float VerticalFieldOfViewDegrees = 60.0f;
+    RayTracing::CameraLens Lens;
+    RayTracing::MotionData::Exposure Motion;
 };
 
 enum class LightType
@@ -144,7 +153,8 @@ struct Light
 enum class DemoId
 {
     CornellBox,
-    SponzaAtrium
+    SponzaAtrium,
+    StanfordDragon
 };
 
 struct SceneSnapshot
@@ -175,7 +185,25 @@ struct ViewportSettings
     bool ShadowsEnabled = true;
     bool OutlineEnabled = true;
     SceneNodeId SelectedNode = 0;
-    bool PathTracing = false;
+    RayTracing::Algorithm Integrator = RayTracing::Algorithm::RayTracing;
+    RayTracing::RadiometryMode Radiometry = RayTracing::RadiometryMode::RGB;
+    RayTracing::TransportOptions Transport;
+    RayTracing::SampleSequence Sampling = RayTracing::SampleSequence::Independent;
+    uint32_t SamplingSeed = 0;
+    RayTracing::AdaptiveOptions Adaptive;
+    RayTracing::MediumOptions Medium;
+    RayTracing::MicropolygonOptions Micropolygons;
+    RayTracing::ReconstructionOptions Reconstruction;
+    bool TemporalPreview = false;
+    RayTracing::TemporalOptions Temporal;
+    RayTracing::MetropolisOptions Metropolis;
+    RayTracing::PhotonMappingOptions Photons;
+    RayTracing::ProgressivePhotonOptions ProgressivePhotons;
+    RayTracing::VertexConnectionMergingOptions Vcm;
+    RayTracing::PointGiOptions PointGi;
+    RayTracing::AccelerationType Acceleration = RayTracing::AccelerationType::Bvh;
+    RayTracing::BvhBuildPolicy BvhPolicy = RayTracing::BvhBuildPolicy::Default;
+    RayTracing::GeometryMode Geometry = RayTracing::GeometryMode::Flat;
     std::uint32_t PreviewSamples = 1;
     std::uint32_t MaxBounces = 4;
 };

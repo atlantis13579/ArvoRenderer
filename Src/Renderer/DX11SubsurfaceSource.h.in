@@ -1,0 +1,5 @@
+// Embed only the independently written DX11 preview algorithm.
+#pragma once
+inline constexpr const char* DX11SubsurfaceShaderSource = R"ARVO_SHADER(
+@ARVO_DX11_SUBSURFACE_SOURCE@
+)ARVO_SHADER";

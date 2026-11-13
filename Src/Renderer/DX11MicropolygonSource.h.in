@@ -1,0 +1,5 @@
+#pragma once
+namespace Arvo::Renderer
+{
+inline constexpr char DX11MicropolygonSource[] = R"ARVO_DX11(@ARVO_DX11_MICROPOLYGON_SOURCE@)ARVO_DX11";
+}

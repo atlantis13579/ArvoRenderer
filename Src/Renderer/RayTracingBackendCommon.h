@@ -16,6 +16,10 @@ namespace Detail
 {
     using CancellationProbe = std::function<bool()>;
 
+    // Rendering capabilities are separate from geometry-only ray queries.
+    bool ValidateMaterialTransport(const Scene& scene, BackendType backend,
+        Algorithm algorithm, std::string& error);
+
     struct alignas(16) PackedRayTextureDescriptor
     {
         uint32_t OffsetTexels = 0;

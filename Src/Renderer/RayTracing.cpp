@@ -25,6 +25,32 @@ namespace RayTracing
         return lhs.X * rhs.X + lhs.Y * rhs.Y + lhs.Z * rhs.Z;
     }
 
+    bool ValidateRayQueries(const std::vector<Ray>& rays, std::string& error)
+    {
+        constexpr size_t MaximumQueryBatch = 1u << 20;
+        if (rays.size() > MaximumQueryBatch)
+        {
+            error = "A native ray-query batch may contain at most 1048576 rays.";
+            return false;
+        }
+        const auto finite = [](const Float3& value)
+        {
+            return std::isfinite(value.X) && std::isfinite(value.Y) && std::isfinite(value.Z);
+        };
+        for (const Ray& ray : rays)
+        {
+            if (!finite(ray.Origin) || !finite(ray.Direction)
+                || (ray.Direction.X == 0 && ray.Direction.Y == 0 && ray.Direction.Z == 0)
+                || !std::isfinite(ray.MinDistance) || !std::isfinite(ray.MaxDistance)
+                || ray.MinDistance < 0 || ray.MaxDistance < ray.MinDistance)
+            {
+                error = "Ray queries require finite origins, nonzero finite directions, and finite 0 <= min <= max intervals.";
+                return false;
+            }
+        }
+        return true;
+    }
+
     Float3 Cross(const Float3& lhs, const Float3& rhs)
     {
         return Float3(

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "IRHI.h"
+#include "Renderer/MicropolygonPreparation.h"
 
 #include <memory>
 
@@ -17,6 +18,8 @@ namespace Arvo::Renderer
 		bool Initialize(const RHICreateInfo& createInfo) override;
 		void Shutdown() override;
 		bool IsInitialized() const override;
+        RayTracing::MicropolygonResult PrepareMicropolygons(const RayTracing::Scene&,const RayTracing::Camera&,
+            const RayTracing::RenderSettings&,const RayTracing::CancellationToken& = {});
 		RHIBackend GetBackend() const override;
 		const char* GetName() const override;
 		RHICapabilities GetCapabilities() const override;

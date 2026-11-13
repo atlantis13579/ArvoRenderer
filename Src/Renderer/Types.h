@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Renderer/RayTracing.h"
+
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -94,10 +96,14 @@ namespace Arvo::Renderer
 		Float3 CameraPosition = { 0.0f, 0.0f, 5.0f };
 		Float3 AmbientColor = { 1.0f, 1.0f, 1.0f };
 		float AmbientStrength = 0.08f;
+		// Linear distant radiance, matching the offline Scene defaults.
+		Float3 EnvironmentTop = {0.02f, 0.02f, 0.025f};
+		Float3 EnvironmentBottom = {0.02f, 0.02f, 0.025f};
 	};
 
 	struct MaterialData
 	{
+		RayTracing::MaterialScattering Scattering;
 		// Linear Phong diffuse reflectance (Kd); alpha is scalar opacity.
 		Float4 BaseColor = { 1.0f, 1.0f, 1.0f, 1.0f };
 		// Linear Phong ambient reflectance (Ka).
@@ -206,6 +212,8 @@ namespace Arvo::Renderer
 		bool BlendEnabled = false;
 		bool SamplesShadowMap = false;
 		bool OutlineExtrusion = false;
+		bool MediumBackground = false;
+		RayTracing::MediumOptions Medium;
 		// Linear object tint for material passes. Wireframe and outline passes
 		// interpret RGB as their display-sRGB override color.
 		Float4 Color = { 1.0f, 1.0f, 1.0f, 1.0f };
@@ -215,6 +223,7 @@ namespace Arvo::Renderer
 		Float4 MaterialAmbientColor = { 1.0f, 1.0f, 1.0f, 1.0f };
 		Float4 MaterialSpecularColor = { 0.0f, 0.0f, 0.0f, 1.0f };
 		Float4 MaterialEmissiveColor = { 0.0f, 0.0f, 0.0f, 1.0f };
+		RayTracing::MaterialScattering Scattering;
 		float MaterialShininess = 32.0f;
 		float MaterialOpacity = 1.0f;
 		float AlphaCutoff = 0.0f;

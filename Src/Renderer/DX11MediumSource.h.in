@@ -1,0 +1,5 @@
+// Embed the handwritten DX11 source verbatim; never translate an offline backend.
+#pragma once
+inline constexpr const char* DX11MediumShaderSource = R"ARVO_SHADER(
+@ARVO_DX11_MEDIUM_SOURCE@
+)ARVO_SHADER";

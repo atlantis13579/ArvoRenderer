@@ -10,6 +10,7 @@ namespace Arvo
 {
 namespace RayTracing
 {
+namespace Cpu { struct PreparedSpectralFrame; }
 namespace Detail
 {
     using UnitFunction = std::function<void(uint32_t)>;
@@ -41,13 +42,15 @@ namespace Detail
         const Camera& camera,
         const RenderSettings& settings,
         PersistentExecutor& executor,
-        const CancellationProbe& cancellation);
+        const CancellationProbe& cancellation,
+        const Cpu::PreparedSpectralFrame* spectral = nullptr);
 
+    // Fixed-time diagnostic queries have no light-transport schedule to validate.
     bool ValidateRenderInput(
         const Scene& scene,
         const Camera& camera,
         const RenderSettings& settings,
-        std::string& error);
+        std::string& error, bool validateMotionSchedule = true);
 }
 }
 }

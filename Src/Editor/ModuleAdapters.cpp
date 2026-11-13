@@ -2,7 +2,13 @@
 
 #include "Maths/ArvoMaths.h"
 #include "RayTracer/RayTracer.h"
+#include "Renderer/DxrRayTracingRHI.h"
 #include "Renderer/ArvoRenderer.h"
+#include "Renderer/TemporalSession.h"
+#include "Renderer/DX11CameraExposure.h"
+#include "Renderer/DX11InstanceExposure.h"
+#include "Renderer/DX11RHI.h"
+#include "Renderer/MicropolygonPreparation.h"
 
 #include <algorithm>
 #include <array>
@@ -288,6 +294,7 @@ using RendererImageCache =
         source->Specular.R, source->Specular.G, source->Specular.B, source->Specular.A};
     result.EmissiveColor = {
         source->Emissive.R, source->Emissive.G, source->Emissive.B, source->Emissive.A};
+    result.Scattering = source->Scattering;
     result.Shininess = std::max(source->Shininess, 1.0f);
     result.AlphaCutoff =
         source->OpacityImage && source->OpacityImage->IsValid() ? 0.5f : 0.0f;
@@ -349,6 +356,12 @@ using RendererImageCache =
     return result;
 }
 
+Maths::Matrix4 PreviewNodeMatrix(const SceneSnapshot& scene, const SceneNode& node)
+{
+    return Renderer::InstanceAtExposureMidpoint(ToMath(node.LocalTransform).ToMatrix(), node.Motion,
+                                                scene.SceneCamera.Motion.Interval);
+}
+
 struct ShadowFrame
 {
     Maths::Matrix4 ViewProjection;
@@ -365,7 +378,7 @@ struct ShadowFrame
     for (const SceneNode& node : scene.Nodes)
     {
         if (!node.Visible || !node.Mesh) continue;
-        const Maths::Transform transform = ToMath(node.LocalTransform);
+        const Maths::Matrix4 transform = PreviewNodeMatrix(scene, node);
         for (const Vertex& vertex : node.Mesh->Vertices)
         {
             bounds.Expand(transform.TransformPoint(ToMath(vertex.Position)));
@@ -867,17 +880,16 @@ struct RealtimeCacheKey
     bool ShadowsEnabled = false;
     bool OutlineEnabled = false;
     SceneNodeId SelectedNode = 0;
+    RayTracing::MicropolygonOptions Micropolygons;
+    RayTracing::MediumOptions Medium;
 
     friend bool operator==(const RealtimeCacheKey& left, const RealtimeCacheKey& right)
     {
-        return left.Demo == right.Demo &&
-               left.Revision == right.Revision &&
-               left.CameraRevision == right.CameraRevision &&
-               left.Width == right.Width &&
-               left.Height == right.Height &&
-               left.Mode == right.Mode &&
-               left.ShadowsEnabled == right.ShadowsEnabled &&
-               left.OutlineEnabled == right.OutlineEnabled &&
+        return left.Demo == right.Demo && left.Revision == right.Revision &&
+               left.CameraRevision == right.CameraRevision && left.Width == right.Width &&
+               left.Height == right.Height && left.Mode == right.Mode &&
+               left.ShadowsEnabled == right.ShadowsEnabled && left.OutlineEnabled == right.OutlineEnabled &&
+               left.Micropolygons == right.Micropolygons && left.Medium == right.Medium &&
                left.SelectedNode == right.SelectedNode;
     }
 };
@@ -894,6 +906,8 @@ struct RealtimeCacheKey
     key.ShadowsEnabled = request.Settings.ShadowsEnabled;
     key.OutlineEnabled = request.Settings.OutlineEnabled;
     key.SelectedNode = request.Settings.SelectedNode;
+    key.Micropolygons = request.Settings.Micropolygons;
+    key.Medium = request.Settings.Medium;
     return key;
 }
 
@@ -903,14 +917,18 @@ struct RealtimeSceneCacheKey
     std::uint64_t Revision = 0;
     Renderer::RHIBackend Backend = Renderer::RHIBackend::Vulkan;
     bool FullMaterial = false;
+    RayTracing::MicropolygonOptions Micropolygons;
+    uint64_t DicingCameraRevision = 0;
+    uint32_t DicingWidth = 0, DicingHeight = 0;
 
     friend bool operator==(
         const RealtimeSceneCacheKey& left,
         const RealtimeSceneCacheKey& right)
     {
-        return left.Demo == right.Demo &&
-               left.Revision == right.Revision &&
-               left.Backend == right.Backend &&
+        return left.Demo == right.Demo && left.Revision == right.Revision && left.Backend == right.Backend &&
+               left.Micropolygons == right.Micropolygons &&
+               left.DicingCameraRevision == right.DicingCameraRevision &&
+               left.DicingWidth == right.DicingWidth && left.DicingHeight == right.DicingHeight &&
                left.FullMaterial == right.FullMaterial;
     }
 };
@@ -925,6 +943,13 @@ struct RealtimeSceneCacheKey
     key.Revision = request.Scene->Revision;
     key.Backend = backend;
     key.FullMaterial = fullMaterial;
+    key.Micropolygons = request.Settings.Micropolygons;
+    if (key.Micropolygons.Enabled)
+    {
+        key.DicingCameraRevision = request.Scene->CameraRevision;
+        key.DicingWidth = request.Settings.Width;
+        key.DicingHeight = request.Settings.Height;
+    }
     return key;
 }
 
@@ -1003,21 +1028,32 @@ public:
             bool Success = false;
             bool Cancelled = false;
             bool SceneInvalidated = false;
+            std::shared_ptr<const std::vector<Renderer::MeshData>> PreparedMeshes;
+            std::shared_ptr<const SceneSnapshot> PreparedSnapshot;
             std::string Error;
         };
         std::shared_ptr<const std::vector<Renderer::MeshData>> meshes;
+        std::shared_ptr<const SceneSnapshot> previewScene = request.Scene;
+        std::shared_ptr<const RayTracing::Scene> dicingInput;
         bool convertedSceneCandidate = false;
         if (SceneCacheValid_ && sceneKey == SceneCacheKey_)
         {
             meshes = SceneCacheMeshes_;
+            if (request.Settings.Micropolygons.Enabled && SceneCacheSnapshot_)
+                previewScene = SceneCacheSnapshot_;
         }
         else
         {
-            meshes = std::make_shared<std::vector<Renderer::MeshData>>(
-                BuildRendererMeshes(
-                    *request.Scene,
-                    cancellation,
-                    fullMaterial));
+            if (request.Settings.Micropolygons.Enabled)
+            {
+                if (backend != Renderer::RHIBackend::DX11)
+                    return Failed("Micropolygon preview requires DX11 or DXR");
+                dicingInput = BuildOfflineScene(*request.Scene, RayTracing::GeometryMode::Instanced);
+                meshes = std::make_shared<std::vector<Renderer::MeshData>>();
+            }
+            else
+                meshes = std::make_shared<std::vector<Renderer::MeshData>>(
+                    BuildRendererMeshes(*request.Scene, cancellation, fullMaterial));
             convertedSceneCandidate = true;
         }
         if (cancellation.IsCancellationRequested()) return Cancelled();
@@ -1028,35 +1064,53 @@ public:
         std::future<ConfigureResult> configureFuture = configured->get_future();
         const ViewportSettings settings = request.Settings;
         const float aspect = static_cast<float>(settings.Width) / static_cast<float>(settings.Height);
+        const auto previewCamera = Renderer::CameraAtExposureMidpoint(BuildOfflineCamera(*request.Scene));
         const Maths::Matrix4 view = Maths::Matrix4::LookAtRH(
-            ToMath(request.Scene->SceneCamera.Position),
-            ToMath(request.Scene->SceneCamera.Target),
-            ToMath(request.Scene->SceneCamera.Up));
+            {previewCamera.Position.X, previewCamera.Position.Y, previewCamera.Position.Z},
+            {previewCamera.Target.X, previewCamera.Target.Y, previewCamera.Target.Z},
+            {previewCamera.Up.X, previewCamera.Up.Y, previewCamera.Up.Z});
         const Maths::Matrix4 projection = Maths::Matrix4::PerspectiveRH(
             request.Scene->SceneCamera.VerticalFieldOfViewDegrees * Pi / 180.0f,
             aspect,
             0.05f,
             1000.0f);
         const Renderer::Matrix4 viewProjection = ToRendererMatrix(projection * view);
-        const Renderer::LightingState lighting = BuildRendererLighting(*request.Scene);
+        Renderer::LightingState lighting = BuildRendererLighting(*request.Scene);
+        lighting.CameraPosition = {previewCamera.Position.X, previewCamera.Position.Y,
+                                   previewCamera.Position.Z};
+        std::unordered_map<SceneNodeId, Renderer::Matrix4> previewTransforms;
+        for (const auto& node : previewScene->Nodes)
+            if (node.Mesh)
+                previewTransforms.emplace(node.Id, ToRendererMatrix(PreviewNodeMatrix(*previewScene, node)));
+        const auto shutter = request.Scene->SceneCamera.Motion.Interval;
+        const bool changedMotionTime = HasObjectMotion(*request.Scene) &&
+            (shutter.Open != ShadowShutter_.Open || shutter.Close != ShadowShutter_.Close);
         ShadowFrame shadowFrame;
         if (settings.ShadowsEnabled && settings.Mode != FillMode::Wireframe)
         {
-            if (!ShadowCacheValid_ || !(sceneKey == ShadowCacheKey_))
+            if (settings.Micropolygons.Enabled)
             {
-                CachedShadow_ = BuildShadowFrame(*request.Scene, !fullMaterial);
-                ShadowCacheKey_ = sceneKey;
-                ShadowCacheValid_ = true;
+                if (!dicingInput)
+                    shadowFrame = BuildShadowFrame(*previewScene, !fullMaterial);
             }
-            shadowFrame = CachedShadow_;
+            else
+            {
+                if (!ShadowCacheValid_ || !(sceneKey == ShadowCacheKey_) || changedMotionTime)
+                {
+                    CachedShadow_ = BuildShadowFrame(*request.Scene, !fullMaterial);
+                    ShadowCacheKey_ = sceneKey;
+                    ShadowShutter_ = shutter;
+                    ShadowCacheValid_ = true;
+                }
+                shadowFrame = CachedShadow_;
+            }
         }
-        const Renderer::Matrix4 lightViewProjection = ToRendererMatrix(
-            shadowFrame.Valid ? shadowFrame.ViewProjection : Maths::Matrix4::Identity());
+        Renderer::Matrix4 lightViewProjection =
+            ToRendererMatrix(shadowFrame.Valid ? shadowFrame.ViewProjection : Maths::Matrix4::Identity());
         const bool enqueued = Context_.Thread.Enqueue(
             [meshes, configured, settings, backend, viewProjection, lightViewProjection, lighting,
-             hasShadowFrame = shadowFrame.Valid, uploadScene, cancellation](
-                Renderer::Renderer& renderer)
-            {
+             previewScene, dicingInput, hasShadowFrame = shadowFrame.Valid, uploadScene, cancellation,
+             previewTransforms = std::move(previewTransforms)](Renderer::Renderer& renderer) mutable {
                 ConfigureResult result;
                 try
                 {
@@ -1111,6 +1165,49 @@ public:
                         rendererRecreated = true;
                     }
 
+                    if (dicingInput)
+                    {
+                        auto* dx11 = dynamic_cast<Renderer::DX11RHI*>(renderer.GetRHI());
+                        if (!dx11)
+                            throw std::runtime_error("DX11 native dicing requires the DX11 preview RHI");
+                        RayTracing::RenderSettings dicingSettings;
+                        dicingSettings.Width = settings.Width;
+                        dicingSettings.Height = settings.Height;
+                        dicingSettings.Micropolygons = settings.Micropolygons;
+                        auto diced = dx11->PrepareMicropolygons(
+                            *dicingInput, BuildOfflineCamera(*previewScene), dicingSettings,
+                            RayTracing::CancellationToken::FromSharedState(cancellation.SharedState()));
+                        if (diced.Status != RayTracing::RenderStatus::Completed)
+                        {
+                            result.Cancelled = diced.Status == RayTracing::RenderStatus::Cancelled;
+                            result.Error = std::move(diced.Error);
+                            configured->set_value(std::move(result));
+                            return;
+                        }
+                        previewScene = BuildMicropolygonPreviewScene(*previewScene, diced, cancellation);
+                        if (!previewScene)
+                        {
+                            result.Cancelled = true;
+                            configured->set_value(std::move(result));
+                            return;
+                        }
+                        meshes = std::make_shared<std::vector<Renderer::MeshData>>(
+                            BuildRendererMeshes(*previewScene, cancellation, true));
+                        result.PreparedMeshes = meshes;
+                        result.PreparedSnapshot = previewScene;
+                        previewTransforms.clear();
+                        for (const auto& node : previewScene->Nodes)
+                            if (node.Mesh)
+                                previewTransforms.emplace(
+                                    node.Id, ToRendererMatrix(PreviewNodeMatrix(*previewScene, node)));
+                        const auto dicedShadow =
+                            settings.ShadowsEnabled && settings.Mode != FillMode::Wireframe
+                                ? BuildShadowFrame(*previewScene)
+                                : ShadowFrame{};
+                        hasShadowFrame = dicedShadow.Valid;
+                        lightViewProjection = ToRendererMatrix(
+                            dicedShadow.Valid ? dicedShadow.ViewProjection : Maths::Matrix4::Identity());
+                    }
                     const bool replaceScene = uploadScene || rendererRecreated;
                     if (replaceScene)
                     {
@@ -1121,6 +1218,12 @@ public:
                     renderer.SetViewProjection(viewProjection);
                     renderer.SetLightViewProjection(lightViewProjection);
                     renderer.SetLighting(lighting);
+                    if (!renderer.SetMedium(settings.Medium))
+                    {
+                        result.Error = renderer.GetLastError();
+                        configured->set_value(std::move(result));
+                        return;
+                    }
                     renderer.SetRenderMode(ToRendererMode(settings.Mode));
                     renderer.SetShadowsEnabled(settings.ShadowsEnabled && hasShadowFrame);
                     if (replaceScene)
@@ -1146,6 +1249,13 @@ public:
                         if (cancellation.IsCancellationRequested())
                         {
                             result.Cancelled = true;
+                            configured->set_value(std::move(result));
+                            return;
+                        }
+                        if (!renderer.SetWorldTransform(mesh.Id, previewTransforms.at(mesh.SelectionGroup)))
+                        {
+                            result.SceneInvalidated = true;
+                            result.Error = renderer.GetLastError();
                             configured->set_value(std::move(result));
                             return;
                         }
@@ -1184,7 +1294,8 @@ public:
             if (convertedSceneCandidate)
             {
                 SceneCacheKey_ = sceneKey;
-                SceneCacheMeshes_ = meshes;
+                SceneCacheMeshes_ = configureResult.PreparedMeshes ? configureResult.PreparedMeshes : meshes;
+                SceneCacheSnapshot_ = configureResult.PreparedSnapshot;
                 SceneCacheValid_ = true;
             }
         }
@@ -1299,11 +1410,13 @@ private:
     bool SceneCacheValid_ = false;
     RealtimeSceneCacheKey SceneCacheKey_;
     std::shared_ptr<const std::vector<Renderer::MeshData>> SceneCacheMeshes_;
+    std::shared_ptr<const SceneSnapshot> SceneCacheSnapshot_;
     bool UploadedSceneValid_ = false;
     RealtimeSceneCacheKey UploadedSceneKey_;
     bool ShadowCacheValid_ = false;
     RealtimeSceneCacheKey ShadowCacheKey_;
     ShadowFrame CachedShadow_;
+    RayTracing::MotionData::Shutter ShadowShutter_;
 };
 
 [[nodiscard]] std::uint32_t RayMaterialIndex(
@@ -1360,8 +1473,13 @@ using RayTextureCache =
 
 [[nodiscard]] std::shared_ptr<const RayTracing::Scene> BuildRayScene(
     const SceneSnapshot& source,
-    const CancellationToken& cancellation)
+    const CancellationToken& cancellation,
+    RayTracing::GeometryMode geometryMode)
 {
+    if (!RayTracing::GeometryModeKey(geometryMode)) throw std::invalid_argument("Unknown geometry mode");
+    const bool instanced = geometryMode == RayTracing::GeometryMode::Instanced;
+    if (!instanced && HasObjectMotion(source))
+        throw std::invalid_argument("Object motion requires instanced geometry");
     auto scene = std::make_shared<RayTracing::Scene>();
     RayTextureCache textureCache;
     if (source.Materials.empty())
@@ -1374,6 +1492,7 @@ using RayTextureCache =
         for (const Material& sourceMaterial : source.Materials)
         {
             RayTracing::Material material;
+            static_cast<RayTracing::MaterialScattering&>(material) = sourceMaterial.Scattering;
             material.Albedo = {
                 sourceMaterial.Diffuse.R,
                 sourceMaterial.Diffuse.G,
@@ -1400,9 +1519,7 @@ using RayTextureCache =
             material.Shininess = std::max(sourceMaterial.Shininess, 1.0f);
             // MTL Ks/Ns describe a local Phong highlight, not mirror transport.
             material.Reflectivity = 0.0f;
-            // CornellEmitter constructs the explicit rectangle from this same mesh and Ke.
-            material.SampledEmitter = source.Demo == DemoId::CornellBox
-                && sourceMaterial.Name == "light" && !source.Lights.empty();
+            material.SampledEmitter = sourceMaterial.SampledEmitter && !source.Lights.empty();
             material.DiffuseTextureIndex = AddRayTexture(
                 sourceMaterial.DiffuseImage,
                 *scene,
@@ -1416,13 +1533,43 @@ using RayTextureCache =
     {
         if (node.Visible && node.Mesh) triangleCount += node.Mesh->Indices.size() / 3;
     }
-    scene->Triangles.reserve(triangleCount);
+    if (!instanced) scene->Triangles.reserve(triangleCount);
+    std::unordered_map<const MeshAsset*, uint32_t> geometryIndices;
     for (const SceneNode& node : source.Nodes)
     {
         if (cancellation.IsCancellationRequested()) return nullptr;
         if (!node.Visible || !node.Mesh) continue;
         const MeshAsset& mesh = *node.Mesh;
-        const Maths::Transform transform = ToMath(node.LocalTransform);
+        Maths::Transform transform = ToMath(node.LocalTransform);
+        std::vector<RayTracing::Triangle>* output = &scene->Triangles;
+        std::shared_ptr<RayTracing::SceneGeometry> geometry;
+        if (instanced)
+        {
+            RayTracing::GeometryInstance instance;
+            instance.Motion = node.Motion;
+            const Maths::Matrix4 matrix = transform.ToMatrix();
+            for (uint32_t row = 0; row < 3; ++row)
+                for (uint32_t column = 0; column < 4; ++column)
+                    instance.ObjectToWorld[row * 4 + column] = matrix(row, column);
+            const auto found = geometryIndices.find(node.Mesh.get());
+            if (found != geometryIndices.end())
+            {
+                instance.GeometryIndex = found->second;
+                scene->Instances.push_back(instance);
+                continue;
+            }
+            geometry = std::make_shared<RayTracing::SceneGeometry>();
+            geometry->Triangles.reserve(mesh.Indices.size() / 3);
+            instance.GeometryIndex = static_cast<uint32_t>(scene->Geometries.size());
+            geometryIndices.emplace(node.Mesh.get(), instance.GeometryIndex);
+            scene->Geometries.push_back(geometry);
+            scene->Instances.push_back(instance);
+            output = &geometry->Triangles;
+            transform = Maths::Transform::Identity();
+        }
+        // Preserve the object's exterior under reflection, matching inverse-
+        // transpose normals in native instances. Swap all vertex attributes by index.
+        const bool reverseWinding = (transform.Scale.x < 0) ^ (transform.Scale.y < 0) ^ (transform.Scale.z < 0);
         for (std::size_t firstIndex = 0; firstIndex + 2 < mesh.Indices.size(); firstIndex += 3)
         {
             if (firstIndex % (4096U * 3U) == 0 && cancellation.IsCancellationRequested())
@@ -1430,8 +1577,8 @@ using RayTextureCache =
                 return nullptr;
             }
             const std::uint32_t i0 = mesh.Indices[firstIndex];
-            const std::uint32_t i1 = mesh.Indices[firstIndex + 1];
-            const std::uint32_t i2 = mesh.Indices[firstIndex + 2];
+            const std::uint32_t i1 = mesh.Indices[firstIndex + (reverseWinding ? 2 : 1)];
+            const std::uint32_t i2 = mesh.Indices[firstIndex + (reverseWinding ? 1 : 2)];
             if (i0 >= mesh.Vertices.size() || i1 >= mesh.Vertices.size() || i2 >= mesh.Vertices.size())
             {
                 continue;
@@ -1473,16 +1620,15 @@ using RayTextureCache =
             triangle.TexCoord2 = {v2.TexCoord.X, v2.TexCoord.Y};
             triangle.SmoothNormals = true;
             triangle.MaterialIndex = RayMaterialIndex(source, mesh, firstIndex);
-            scene->Triangles.push_back(triangle);
+            output->push_back(triangle);
         }
     }
 
-    const LightSelection lightSelection = SelectLights(source);
-    for (std::size_t lightIndex = 0; lightIndex < lightSelection.Count; ++lightIndex)
+    // Offline transport keeps every emitter and its own visibility policy.
+    // The raster preview's light limit and single shadow map do not apply here.
+    for (const Light& sourceLight : source.Lights)
     {
-        const Light& sourceLight = source.Lights[lightSelection.SceneIndices[lightIndex]];
-        const bool castsShadows =
-            static_cast<std::int32_t>(lightIndex) == lightSelection.ShadowLightIndex;
+        const bool castsShadows = sourceLight.CastShadows;
         if (sourceLight.Type == LightType::Directional)
         {
             const Maths::Vector3 directionToLight =
@@ -1561,6 +1707,7 @@ public:
     }
 
     [[nodiscard]] BackendDescriptor Descriptor() const override { return Descriptor_; }
+    void ResetTemporalHistory() override { Temporal_.Reset(); }
 
     [[nodiscard]] bool IsAvailable() const override
     {
@@ -1573,25 +1720,28 @@ public:
     {
         if (!request.Scene) return Failed("The ray tracing request has no scene");
         if (!RHI_) return Failed("The selected ray tracing backend is unavailable");
+        if (!RayTracing::GeometryModeKey(request.Settings.Geometry)) return Failed("Unknown geometry mode");
         if (cancellation.IsCancellationRequested()) return Cancelled();
         std::shared_ptr<const RayTracing::Scene> scene;
         {
             std::lock_guard<std::mutex> lock(SceneCacheMutex_);
             if (CachedScene_ && CachedDemo_ == request.Scene->Demo &&
-                CachedRevision_ == request.Scene->Revision)
+                CachedRevision_ == request.Scene->Revision && CachedGeometry_ == request.Settings.Geometry)
             {
                 scene = CachedScene_;
             }
         }
         if (!scene)
         {
-            scene = BuildRayScene(*request.Scene, cancellation);
+            scene = BuildRayScene(*request.Scene, cancellation, request.Settings.Geometry);
             if (scene && !cancellation.IsCancellationRequested())
             {
                 std::lock_guard<std::mutex> lock(SceneCacheMutex_);
                 CachedDemo_ = request.Scene->Demo;
                 CachedRevision_ = request.Scene->Revision;
+                CachedGeometry_ = request.Settings.Geometry;
                 CachedScene_ = scene;
+                Temporal_.Reset();
             }
         }
         if (!scene || cancellation.IsCancellationRequested()) return Cancelled();
@@ -1610,16 +1760,50 @@ public:
             request.Scene->SceneCamera.Up.Y,
             request.Scene->SceneCamera.Up.Z};
         camera.VerticalFieldOfViewDegrees = request.Scene->SceneCamera.VerticalFieldOfViewDegrees;
+        camera.Lens = request.Scene->SceneCamera.Lens;
+        camera.Motion = request.Scene->SceneCamera.Motion;
 
         RayTracing::RenderSettings settings;
         settings.Width = request.Settings.Width;
         settings.Height = request.Settings.Height;
         settings.SamplesPerPixel = request.Settings.PreviewSamples;
         settings.MaxReflectionBounces = request.Settings.MaxBounces;
-        settings.Integrator = request.Settings.PathTracing
-            ? RayTracing::Algorithm::PathTracing : RayTracing::Algorithm::RayTracing;
+        settings.Integrator = request.Settings.Integrator;
+        settings.Radiometry = request.Settings.Radiometry;
+        settings.Transport = request.Settings.Transport;
+        settings.Sampling = request.Settings.Sampling;
+        settings.SamplingSeed = request.Settings.SamplingSeed;
+        settings.Adaptive = request.Settings.Adaptive;
+        settings.Medium = request.Settings.Medium;
+        settings.Micropolygons = request.Settings.Micropolygons;
+        settings.Reconstruction = request.Settings.Reconstruction;
+        settings.Metropolis = request.Settings.Metropolis;
+        settings.Photons = request.Settings.Photons;
+        settings.ProgressivePhotons = request.Settings.ProgressivePhotons;
+        settings.Vcm = request.Settings.Vcm;
+        settings.PointGi = request.Settings.PointGi;
+        settings.Acceleration = request.Settings.Acceleration;
+        settings.BvhPolicy = request.Settings.BvhPolicy;
         settings.ShadowsEnabled = request.Settings.ShadowsEnabled;
         settings.ShadowStrength = 1.0f;
+        if (request.Settings.TemporalPreview)
+        {
+            const auto token = RayTracing::CancellationToken::FromSharedState(cancellation.SharedState());
+            auto temporal = Temporal_.Render(*RHI_, scene, camera, settings, request.Scene->Revision,
+                                             request.Settings.Temporal, token);
+            if (temporal.Status == RayTracing::RenderStatus::Cancelled || cancellation.IsCancellationRequested())
+                return Cancelled();
+            if (temporal.Status != RayTracing::RenderStatus::Completed) return Failed(temporal.Error);
+            RenderResult result;
+            result.Status = RenderStatus::Completed;
+            result.Output.Width = temporal.Display.GetWidth();
+            result.Output.Height = temporal.Display.GetHeight();
+            result.Output.PixelsRGBA8 = std::move(temporal.Display.GetPixelsRGBA8());
+            result.Accept = std::move(temporal.Accept);
+            result.ContinueRendering = true;
+            return result;
+        }
+        Temporal_.Reset();
         RayTracing::RenderJob job = RHI_->RenderAsync(scene, camera, settings);
         while (!job.IsReady())
         {
@@ -1654,13 +1838,10 @@ private:
     std::mutex SceneCacheMutex_;
     DemoId CachedDemo_ = DemoId::CornellBox;
     std::uint64_t CachedRevision_ = 0;
+    RayTracing::GeometryMode CachedGeometry_ = RayTracing::GeometryMode::Flat;
     std::shared_ptr<const RayTracing::Scene> CachedScene_;
+    RayTracing::TemporalSession Temporal_;
 };
-
-[[nodiscard]] Renderer::RHIBackend RealtimeBackend(const std::string& id)
-{
-    return id == "renderer.metal" ? Renderer::RHIBackend::Metal : Renderer::RHIBackend::DX11;
-}
 
 struct CachedPickMesh
 {
@@ -1736,10 +1917,76 @@ struct PickCache
 
 } // namespace
 
-std::shared_ptr<const RayTracing::Scene> BuildOfflineScene(const SceneSnapshot& scene)
+std::shared_ptr<const SceneSnapshot> BuildMicropolygonPreviewScene(
+    const SceneSnapshot& source, const RayTracing::MicropolygonResult& diced,
+    const CancellationToken& cancellation)
+{
+    if (!diced.Geometry || !diced.Geometry->Triangles.empty() || !diced.Geometry->Spheres.empty() ||
+        diced.InstanceSources.size() != diced.Geometry->Instances.size())
+        throw std::runtime_error("DX11 preview requires mapped mesh instances");
+    std::vector<const SceneNode*> sourceNodes;
+    for (const auto& node : source.Nodes)
+        if (node.Visible && node.Mesh)
+            sourceNodes.push_back(&node);
+    auto result = std::make_shared<SceneSnapshot>(source);
+    result->Nodes.clear();
+    for (size_t index = 0; index < diced.Geometry->Instances.size(); ++index)
+    {
+        if (cancellation.IsCancellationRequested())
+            return {};
+        const auto& instance = diced.Geometry->Instances[index];
+        const auto& geometry = *diced.Geometry->Geometries.at(instance.GeometryIndex);
+        if (!geometry.Spheres.empty())
+            throw std::runtime_error("DX11 preview needs triangle geometry");
+        SceneNode node = *sourceNodes.at(diced.InstanceSources[index]);
+        auto mesh = std::make_shared<MeshAsset>();
+        mesh->Name = node.Mesh->Name;
+        mesh->Vertices.reserve(geometry.Triangles.size() * 3);
+        mesh->Indices.reserve(geometry.Triangles.size() * 3);
+        uint32_t previousMaterial = std::numeric_limits<uint32_t>::max();
+        for (const auto& triangle : geometry.Triangles)
+        {
+            if (cancellation.IsCancellationRequested())
+                return {};
+            if (!source.Materials.empty() && previousMaterial != triangle.MaterialIndex)
+            {
+                mesh->Sections.push_back(
+                    {source.Materials.at(triangle.MaterialIndex).Name, uint32_t(mesh->Indices.size()), 0});
+                previousMaterial = triangle.MaterialIndex;
+            }
+            const RayTracing::Float3 positions[]{triangle.Position0, triangle.Position1, triangle.Position2};
+            const RayTracing::Float3 normals[]{triangle.Normal0, triangle.Normal1, triangle.Normal2};
+            const RayTracing::Float3 colors[]{triangle.Color0, triangle.Color1, triangle.Color2};
+            const RayTracing::Float2 uvs[]{triangle.TexCoord0, triangle.TexCoord1, triangle.TexCoord2};
+            for (uint32_t corner = 0; corner < 3; ++corner)
+            {
+                const auto p = positions[corner], n = normals[corner], c = colors[corner];
+                Vertex vertex;
+                vertex.Position = {p.X, p.Y, p.Z};
+                vertex.Normal = {n.X, n.Y, n.Z};
+                vertex.TexCoord = {uvs[corner].X, uvs[corner].Y};
+                vertex.VertexColor = {Maths::LinearToSRGB(c.X), Maths::LinearToSRGB(c.Y),
+                                      Maths::LinearToSRGB(c.Z), 1};
+                mesh->Indices.push_back(uint32_t(mesh->Vertices.size()));
+                mesh->Vertices.push_back(vertex);
+            }
+            if (!mesh->Sections.empty())
+                mesh->Sections.back().IndexCount += 3;
+        }
+        // Static output is in reference world coordinates. Moving output stays
+        // in the source object frame so the existing midpoint exposure is valid.
+        if (!instance.Motion.Enabled)
+            node.LocalTransform = {};
+        node.Mesh = std::move(mesh);
+        result->Nodes.push_back(std::move(node));
+    }
+    return result;
+}
+
+std::shared_ptr<const RayTracing::Scene> BuildOfflineScene(const SceneSnapshot& scene, RayTracing::GeometryMode geometry)
 {
     CancellationSource cancellation;
-    return BuildRayScene(scene, cancellation.Token());
+    return BuildRayScene(scene, cancellation.Token(), geometry);
 }
 
 RayTracing::Camera BuildOfflineCamera(const SceneSnapshot& scene)
@@ -1749,30 +1996,40 @@ RayTracing::Camera BuildOfflineCamera(const SceneSnapshot& scene)
     camera.Target = {scene.SceneCamera.Target.X, scene.SceneCamera.Target.Y, scene.SceneCamera.Target.Z};
     camera.Up = {scene.SceneCamera.Up.X, scene.SceneCamera.Up.Y, scene.SceneCamera.Up.Z};
     camera.VerticalFieldOfViewDegrees = scene.SceneCamera.VerticalFieldOfViewDegrees;
+    camera.Lens = scene.SceneCamera.Lens;
+    camera.Motion = scene.SceneCamera.Motion;
     return camera;
+}
+
+std::shared_ptr<IRenderAdapter> CreateRayRenderAdapter(
+    BackendDescriptor descriptor, std::shared_ptr<RayTracing::IRayTracingRHI> rhi)
+{
+    return std::make_shared<RayRenderAdapter>(std::move(descriptor), std::move(rhi));
 }
 
 void RegisterModuleAdapters(EditorCore& editor)
 {
     for (const BackendDescriptor& descriptor : StandardBackendCatalog())
     {
-        if (!IsBackendSupportedOnPlatform(descriptor, CurrentHostPlatform()))
+        if (!descriptor.SupportsPreview() || !IsBackendSupportedOnPlatform(descriptor, CurrentHostPlatform()))
         {
             continue;
         }
         std::shared_ptr<IRenderAdapter> adapter;
-        if (descriptor.Id == "renderer.dxr")
+        if (descriptor.TransportBackend)
         {
-            adapter = std::make_shared<RayRenderAdapter>(
+            adapter = CreateDxrPreviewAdapter(
                 descriptor,
-                std::make_shared<RayTracing::DxrRayTracingRHI>());
+                *descriptor.TransportBackend == RayTracing::BackendType::DXR
+                    ? Renderer::CreateDxrRHI()
+                    : RayTracing::CreateRayTracingRHI(*descriptor.TransportBackend));
         }
         else if (descriptor.Domain == RenderDomain::RealtimeRenderer)
         {
             adapter = std::make_shared<RealtimeRenderAdapter>(
-                descriptor, RealtimeBackend(descriptor.Id));
+                descriptor, Renderer::RHIBackend::DX11);
         }
-        if (adapter->IsAvailable())
+        if (adapter && adapter->IsAvailable())
         {
             editor.RegisterRenderAdapter(std::move(adapter));
         }
@@ -1803,10 +2060,12 @@ PickHandler CreatePickHandler()
             * halfHeight * aspect;
         const float screenY = (1.0f - std::clamp(request.NormalizedY, 0.0f, 1.0f) * 2.0f)
             * halfHeight;
-        const Maths::Vector3 origin = ToMath(scene.SceneCamera.Position);
-        const Maths::Vector3 forward =
-            (ToMath(scene.SceneCamera.Target) - origin).Normalized();
-        const Maths::Vector3 right = forward.Cross(ToMath(scene.SceneCamera.Up)).Normalized();
+        const auto pickCamera = Renderer::CameraAtExposureMidpoint(BuildOfflineCamera(scene));
+        const Maths::Vector3 origin{pickCamera.Position.X, pickCamera.Position.Y, pickCamera.Position.Z};
+        const Maths::Vector3 target{pickCamera.Target.X, pickCamera.Target.Y, pickCamera.Target.Z};
+        const Maths::Vector3 cameraUp{pickCamera.Up.X, pickCamera.Up.Y, pickCamera.Up.Z};
+        const Maths::Vector3 forward = (target - origin).Normalized();
+        const Maths::Vector3 right = forward.Cross(cameraUp).Normalized();
         const Maths::Vector3 up = right.Cross(forward).Normalized();
         if (forward.LengthSquared() <= 1.0e-8f || right.LengthSquared() <= 1.0e-8f)
         {
@@ -1822,13 +2081,16 @@ PickHandler CreatePickHandler()
             const std::shared_ptr<Maths::TriMesh> mesh = CachedTriMesh(*cache, node.Mesh);
             if (!mesh) continue;
             const Maths::Transform transform = ToMath(node.LocalTransform);
-            const Maths::Vector3 localOrigin = transform.InverseTransformPoint(worldRay.Origin);
-            const Maths::Vector3 localDirection = transform.InverseTransformVector(worldRay.Direction);
+            const auto pose = Renderer::InstanceAtExposureMidpoint(Maths::Matrix4::Identity(), node.Motion,
+                                                                   scene.SceneCamera.Motion.Interval);
+            const auto inversePose = pose.Inversed();
+            const Maths::Vector3 localOrigin = inversePose.TransformPoint(transform.InverseTransformPoint(worldRay.Origin));
+            const Maths::Vector3 localDirection = inversePose.TransformVector(transform.InverseTransformVector(worldRay.Direction));
             if (localDirection.LengthSquared() <= 1.0e-12f) continue;
 
             Maths::TriMeshHit hit;
             if (!mesh->RayCast(Maths::Ray(localOrigin, localDirection), hit)) continue;
-            const Maths::Vector3 worldHit = transform.TransformPoint(hit.Position);
+            const Maths::Vector3 worldHit = transform.TransformPoint(pose.TransformPoint(hit.Position));
             const float worldDistance = (worldHit - worldRay.Origin).Dot(worldRay.Direction);
             if (worldDistance >= 0.0f && worldDistance < closestDistance)
             {

@@ -13,6 +13,8 @@
 
 namespace Arvo::Editor
 {
+bool HasObjectMotion(const SceneSnapshot&);
+bool CanAnimateNode(const SceneSnapshot&, SceneNodeId, std::string& error);
 
 class EditorCore
 {
@@ -31,7 +33,29 @@ public:
     void SetFillMode(FillMode mode);
     void SetShadowsEnabled(bool enabled);
     void SetOutlineEnabled(bool enabled);
-    void SetPreviewIntegrator(bool pathTracing, std::uint32_t samples, std::uint32_t bounces);
+    void SetMaterialScattering(std::size_t index, const RayTracing::MaterialScattering& scattering);
+    void SetSceneMaterialModel(RayTracing::MaterialModel model);
+    void SetCameraLens(const RayTracing::CameraLens& lens);
+    void SetCameraMotion(const RayTracing::MotionData::Exposure& motion);
+    void SetNodeMotion(SceneNodeId node, const RayTracing::MotionData::RigidMotion& motion);
+    void DisableObjectMotion();
+    void SetTemporalPreview(bool enabled, const RayTracing::TemporalOptions& options = {});
+    void SetMicropolygons(const RayTracing::MicropolygonOptions&);
+    void SetPreviewIntegrator(RayTracing::Algorithm integrator, std::uint32_t samples, std::uint32_t bounces,
+                              RayTracing::TransportOptions transport = {},
+                              RayTracing::SampleSequence sampling = RayTracing::SampleSequence::Independent,
+                              RayTracing::AdaptiveOptions adaptive = {},
+                              RayTracing::AccelerationType acceleration = RayTracing::AccelerationType::Bvh,
+                              RayTracing::BvhBuildPolicy bvhPolicy = RayTracing::BvhBuildPolicy::Default,
+                              RayTracing::GeometryMode geometry = RayTracing::GeometryMode::Flat,
+                              RayTracing::MetropolisOptions metropolis = {},
+                              RayTracing::PhotonMappingOptions photons = {},
+                              RayTracing::ProgressivePhotonOptions progressivePhotons = {},
+                              RayTracing::VertexConnectionMergingOptions vcm = {},
+                              RayTracing::PointGiOptions pointGi = {},
+                              RayTracing::ReconstructionOptions reconstruction = {},
+                              uint32_t samplingSeed = 0, RayTracing::MediumOptions medium = {},
+                              RayTracing::RadiometryMode radiometry = RayTracing::RadiometryMode::RGB);
     void ResizeViewport(std::uint32_t width, std::uint32_t height);
     void SelectNode(SceneNodeId node);
     void HandleViewportPointer(float x, float y, const Rect& viewportBounds);
@@ -110,12 +134,13 @@ private:
     std::unordered_map<std::string, std::shared_ptr<IRenderAdapter>> Adapters_;
     PickHandler PickHandler_;
     DemoId SelectedDemo_ = DemoId::CornellBox;
-    std::string SelectedBackend_ = "renderer.dx11";
+    std::string SelectedBackend_ = "renderer.dxr";
     std::string StatusText_ = "No renderer adapter registered";
     Image ViewportImage_;
     std::string ViewportBackend_;
     std::uint64_t ViewportRevision_ = 0;
     std::uint64_t Generation_ = 1;
+    std::uint64_t SceneRevision_ = 0;
     std::uint64_t DemoRequest_ = 1;
     std::uint64_t AppliedDemoRequest_ = 1;
     std::uint64_t PickRequest_ = 0;

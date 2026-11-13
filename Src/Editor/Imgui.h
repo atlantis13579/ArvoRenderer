@@ -23,6 +23,9 @@
 
 #define IMGUI_API
 
+// Text commands anchor a nominal box; presenters center their native font in it.
+inline constexpr int IMGUI_TEXT_HEIGHT = 8;
+
 enum imguiMouseButton
 {
 	IMGUI_MBUT_LEFT = 0x01,

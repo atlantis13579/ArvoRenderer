@@ -1,0 +1,19 @@
+Stanford Dragon
+Original scan/reconstruction: Stanford University Computer Graphics Laboratory.
+Original model and usage terms: https://graphics.stanford.edu/data/3Dscanrep/
+
+This 87,130-triangle OBJ was downloaded unchanged from Sebastian Lague's
+Coding Adventure ray-tracing project, commit e8981eae5e4bc392070a6fdbc7e1a74e295c86fa:
+https://github.com/SebLague/Ray-Tracing/blob/e8981eae5e4bc392070a6fdbc7e1a74e295c86fa/Assets/Graphics/Dragon_80K.obj
+Upstream Git blob: c9331ea9b56dea8873c02f6d6cf712ce60282675
+Downloaded SHA-256: 1cb230b0879f192eee74a887a062da2e4feb7047f2935bf65ddcaa151171de2f
+Git may normalize text line endings; mesh positions, indices and normals are unchanged.
+
+Stanford permits research use and free redistribution with source acknowledgment.
+Commercial use or inclusion in a product for sale requires Stanford's permission;
+consult the original terms above. The repository's software license does not
+replace these model-specific terms. This asset is included for educational
+rendering experiments, with the scan geometry preserved.
+
+Arvo supplies the missing, empty exporter material library and creates framing,
+procedural floor/backdrop geometry and optical materials in DragonDemo.cpp.

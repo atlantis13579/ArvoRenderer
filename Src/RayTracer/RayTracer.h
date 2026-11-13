@@ -21,6 +21,7 @@ namespace RayTracing
     class ComputeShaderRayTracingRHI;
     class MetalRayTracingRHI;
 
+    // Offline factory: CPU, CUDA, Compute Shader, Metal and the shared Renderer DXR implementation.
     ARVO_RAYTRACER_API std::shared_ptr<IRayTracingRHI> CreateRayTracingRHI(
         BackendType type);
     ARVO_RAYTRACER_API const char* ToString(BackendType type);

@@ -1,0 +1,5 @@
+// Embedded verbatim DX11 HLSL; this does not translate or generate another backend.
+#pragma once
+inline constexpr const char* DX11PhysicalShaderSource = R"ARVO_SHADER(
+@ARVO_DX11_PHYSICAL_SOURCE@
+)ARVO_SHADER";

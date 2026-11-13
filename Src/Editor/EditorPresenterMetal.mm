@@ -11,7 +11,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstring>
 #include <iterator>
 #include <limits>
 #include <utility>
@@ -101,11 +100,6 @@ void ReleaseObject(id object)
     {
         [object release];
     }
-}
-
-std::size_t AlignUp(std::size_t value, std::size_t alignment)
-{
-    return (value + alignment - 1u) / alignment * alignment;
 }
 
 std::string ErrorDescription(NSError* error, const char* fallback)
@@ -750,7 +744,7 @@ struct EditorPresenterMetal::Impl
         const float origin = x;
         std::vector<MetalVertex> vertices;
         vertices.reserve(std::strlen(text) * 6u);
-        const float top = ToScreenY(y + static_cast<float>(FontHeight));
+        const float top = ToScreenY(y + (FontHeight + IMGUI_TEXT_HEIGHT) / 2);
         for (const unsigned char* current = reinterpret_cast<const unsigned char*>(text);
              *current != 0;
              ++current)
@@ -971,80 +965,6 @@ struct EditorPresenterMetal::Impl
         return true;
     }
 
-    bool CaptureBackBuffer(Image& output)
-    {
-        output = {};
-        if (Encoder == nil || CommandBuffer == nil || Drawable == nil)
-        {
-            AbortFrame();
-            return Fail("Metal editor has no frame to capture.");
-        }
-        [Encoder endEncoding];
-        Encoder = nil;
-        const NSUInteger width = Drawable.texture.width;
-        const NSUInteger height = Drawable.texture.height;
-        const std::size_t rowPitch = AlignUp(width * 4u, 256u);
-        id<MTLBuffer> readback = [Device
-            newBufferWithLength:rowPitch * height
-            options:MTLResourceStorageModeShared];
-        id<MTLBlitCommandEncoder> blit = [CommandBuffer blitCommandEncoder];
-        if (readback == nil || blit == nil)
-        {
-            ReleaseObject(readback);
-            AbortFrame();
-            return Fail("Metal editor capture allocation failed.");
-        }
-        [blit
-            copyFromTexture:Drawable.texture
-            sourceSlice:0
-            sourceLevel:0
-            sourceOrigin:MTLOriginMake(0, 0, 0)
-            sourceSize:MTLSizeMake(width, height, 1)
-            toBuffer:readback
-            destinationOffset:0
-            destinationBytesPerRow:rowPitch
-            destinationBytesPerImage:rowPitch * height];
-        [blit endEncoding];
-        [CommandBuffer commit];
-        [CommandBuffer waitUntilCompleted];
-        if (CommandBuffer.status == MTLCommandBufferStatusError)
-        {
-            const std::string error = ErrorDescription(
-                CommandBuffer.error,
-                "Metal editor capture command failed.");
-            ReleaseObject(readback);
-            ReleaseFrameResources();
-            return Fail(error);
-        }
-        output.Width = static_cast<std::uint32_t>(width);
-        output.Height = static_cast<std::uint32_t>(height);
-        output.PixelsRGBA8.resize(width * height * 4u);
-        const auto* source = static_cast<const std::uint8_t*>(readback.contents);
-        if (source == nullptr)
-        {
-            ReleaseObject(readback);
-            ReleaseFrameResources();
-            output = {};
-            return Fail("Metal editor capture buffer is not CPU-visible.");
-        }
-        for (NSUInteger y = 0; y < height; ++y)
-        {
-            for (NSUInteger x = 0; x < width; ++x)
-            {
-                const std::size_t sourceOffset = y * rowPitch + x * 4u;
-                const std::size_t destinationOffset = (y * width + x) * 4u;
-                output.PixelsRGBA8[destinationOffset] = source[sourceOffset + 2u];
-                output.PixelsRGBA8[destinationOffset + 1u] = source[sourceOffset + 1u];
-                output.PixelsRGBA8[destinationOffset + 2u] = source[sourceOffset];
-                output.PixelsRGBA8[destinationOffset + 3u] = source[sourceOffset + 3u];
-            }
-        }
-        ReleaseObject(readback);
-        ReleaseFrameResources();
-        LastError.clear();
-        return true;
-    }
-
     NSView* View = nil;
     CAMetalLayer* Layer = nil;
     CALayer* PreviousLayer = nil;
@@ -1120,11 +1040,6 @@ void EditorPresenterMetal::DrawImgui()
 bool EditorPresenterMetal::EndFrame()
 {
     return Impl_->EndFrame();
-}
-
-bool EditorPresenterMetal::CaptureBackBuffer(Image& output)
-{
-    return Impl_->CaptureBackBuffer(output);
 }
 
 bool EditorPresenterMetal::IsInitialized() const noexcept

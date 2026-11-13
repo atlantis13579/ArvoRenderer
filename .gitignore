@@ -1,8 +1,10 @@
 /Binaries/
+/Output/
 /Intermediate/
 /Build/VS2022/
 /Build/Xcode/
 /.vs/
+/.vscode/
 /out/
 *.user
 *.suo

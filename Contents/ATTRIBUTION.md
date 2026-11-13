@@ -23,3 +23,13 @@ are test content distributed under their own licenses.
 
 When redistributing Cornell Box or Sponza content, retain this file and the
 attribution required by CC BY 3.0.
+
+## Stanford Dragon
+
+- Files: `Scenes/Dragon/`
+- Original scan/reconstruction: Stanford University Computer Graphics Laboratory
+- Source model and terms: [Stanford 3D Scanning Repository](https://graphics.stanford.edu/data/3Dscanrep/)
+- Download: [Sebastian Lague's Coding Adventure ray tracer, commit e8981ea](https://github.com/SebLague/Ray-Tracing/blob/e8981eae5e4bc392070a6fdbc7e1a74e295c86fa/Assets/Graphics/Dragon_80K.obj)
+- The source OBJ has 87,130 triangles and is preserved unchanged, apart from possible Git line-ending normalization.
+- Stanford permits research use and free redistribution with acknowledgment; commercial use requires permission. See `Scenes/Dragon/copyright.txt` and the original terms.
+- Arvo authors the clear-glass, frosted-glass and subsurface materials, floor and backdrop in code.

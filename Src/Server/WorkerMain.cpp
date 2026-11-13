@@ -18,7 +18,7 @@ int main(int argc, char** argv)
             const std::string option = argv[index];
             if (option == "--help")
             {
-                std::cout << "ArvoWorker [--bind 127.0.0.1] [--port 7831] [--backend cpu|cuda|compute|metal]\n"
+                std::cout << "ArvoWorker [--bind 127.0.0.1] [--port 7831] [--backend cpu|cuda|compute|metal|dxr]\n"
                              "           [--content-root Contents] [--token TOKEN]\n"
                              "ARVO_WORKER_TOKEN can supply the bearer token without a command-line argument.\n";
                 return 0;
