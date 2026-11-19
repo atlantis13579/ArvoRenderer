@@ -227,6 +227,7 @@ void EditorCore::SetMaterialScattering(std::size_t index, const RayTracing::Mate
     if (!RayTracing::ValidateMaterialScattering(scattering, error)) throw std::invalid_argument(error);
     if (Scene_.Materials[index].Scattering == scattering) return;
     Scene_.Materials[index].Scattering = scattering;
+    Scene_.Materials[index].ScatteringEdited = true;
     Scene_.Revision = ++SceneRevision_;
     InvalidateAndRender();
 }
@@ -244,7 +245,12 @@ void EditorCore::SetSceneMaterialModel(RayTracing::MaterialModel model)
         changed |= material.Scattering.Model != model;
     }
     if (!changed) return;
-    for (auto& material : Scene_.Materials) material.Scattering.Model = model;
+    for (auto& material : Scene_.Materials)
+    {
+        if (material.Scattering.Model == model) continue;
+        material.Scattering.Model = model;
+        material.ScatteringEdited = true;
+    }
     Scene_.Revision = ++SceneRevision_;
     InvalidateAndRender();
 }

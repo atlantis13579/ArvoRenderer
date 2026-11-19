@@ -1,7 +1,6 @@
 #include "Editor/ModuleAdapters.h"
 
 #include "Maths/ArvoMaths.h"
-#include "RayTracer/RayTracer.h"
 #include "Renderer/DxrRayTracingRHI.h"
 #include "Renderer/ArvoRenderer.h"
 #include "Renderer/TemporalSession.h"
@@ -857,6 +856,8 @@ struct LightSelection
         scene.SceneCamera.Position.Z};
     result.AmbientColor = {1.0f, 1.0f, 1.0f};
     result.AmbientStrength = 0.08f;
+    const auto& sky = scene.EnvironmentRadiance;
+    result.EnvironmentTop = result.EnvironmentBottom = {sky.X, sky.Y, sky.Z};
 
     const LightSelection lightSelection = SelectLights(scene);
     for (std::size_t lightIndex = 0; lightIndex < lightSelection.Count; ++lightIndex)
@@ -1481,6 +1482,8 @@ using RayTextureCache =
     if (!instanced && HasObjectMotion(source))
         throw std::invalid_argument("Object motion requires instanced geometry");
     auto scene = std::make_shared<RayTracing::Scene>();
+    const auto& sky = source.EnvironmentRadiance;
+    scene->BackgroundTop = scene->BackgroundBottom = {sky.X, sky.Y, sky.Z};
     RayTextureCache textureCache;
     if (source.Materials.empty())
     {
@@ -1691,13 +1694,6 @@ using RayTextureCache =
 class RayRenderAdapter final : public IRenderAdapter
 {
 public:
-    RayRenderAdapter(BackendDescriptor descriptor, RayTracing::BackendType backend)
-        : RayRenderAdapter(
-            std::move(descriptor),
-            RayTracing::CreateRayTracingRHI(backend))
-    {
-    }
-
     RayRenderAdapter(
         BackendDescriptor descriptor,
         std::shared_ptr<RayTracing::IRayTracingRHI> rhi)
@@ -2016,15 +2012,11 @@ void RegisterModuleAdapters(EditorCore& editor)
             continue;
         }
         std::shared_ptr<IRenderAdapter> adapter;
-        if (descriptor.TransportBackend)
+        if (descriptor.TransportBackend == RayTracing::BackendType::DXR)
         {
-            adapter = CreateDxrPreviewAdapter(
-                descriptor,
-                *descriptor.TransportBackend == RayTracing::BackendType::DXR
-                    ? Renderer::CreateDxrRHI()
-                    : RayTracing::CreateRayTracingRHI(*descriptor.TransportBackend));
+            adapter = CreateDxrPreviewAdapter(descriptor, Renderer::CreateDxrRHI());
         }
-        else if (descriptor.Domain == RenderDomain::RealtimeRenderer)
+        else if (!descriptor.TransportBackend && descriptor.Domain == RenderDomain::RealtimeRenderer)
         {
             adapter = std::make_shared<RealtimeRenderAdapter>(
                 descriptor, Renderer::RHIBackend::DX11);

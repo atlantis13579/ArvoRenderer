@@ -937,6 +937,8 @@ namespace Arvo::Renderer
 		m_CurrentPass = PassType::Color;
 		PassDesc pass;
 		pass.Type = PassType::Color;
+		const Float3 sky = m_Lighting.EnvironmentTop;
+		pass.ClearColor = {sky.X, sky.Y, sky.Z, 1.0f};
 		if (!m_RHI->BeginPass(pass))
 		{
 			return Fail(m_RHI->GetLastError().c_str());

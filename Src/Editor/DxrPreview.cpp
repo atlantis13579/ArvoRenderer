@@ -36,13 +36,12 @@ uint8_t DisplayByte(float linear, const std::array<uint8_t, DisplayLinearInterva
 
 // Preview traces every viewport pixel, with bounded transport independent of
 // the offline estimator. Never trade spatial resolution for a cheaper frame.
-// The same offline Whitted HLSL supplies short ideal reflection/refraction paths.
-// Area emitters become center point sources with hard shadows; rough surfaces
-// use ideal interfaces and SSS uses diffuse albedo. Indirect diffuse transport,
-// global light caches, volume walks, spectral integration and displacement stay
-// offline. A pinhole camera observes the shutter midpoint. Accepted stationary
-// frames average linear radiance; camera/content/settings changes discard that
-// history instead of blurring old views. This is not temporal reprojection.
+// Whitted supplies short ideal reflection/refraction paths. Sponza uses one
+// diffuse bounce by default to light the undersides of its arches.
+// Area emitters become center point sources. Rough surfaces use ideal interfaces
+// and SSS uses diffuse albedo. A pinhole camera observes the shutter midpoint.
+// Stationary frames accumulate linear radiance until the camera, scene or
+// viewport settings change.
 class DxrPreviewAdapter final : public IRenderAdapter
 {
 public:
@@ -107,7 +106,8 @@ public:
         Ray::RenderSettings settings;
         settings.Width = std::max(1u, request.Settings.Width);
         settings.Height = std::max(1u, request.Settings.Height);
-        settings.Integrator = Ray::Algorithm::RayTracing;
+        settings.Integrator = request.Scene->Demo == DemoId::SponzaAtrium
+            ? Ray::Algorithm::PathTracing : Ray::Algorithm::RayTracing;
         settings.SamplesPerPixel = PreviewSamples;
         const bool hasGlass = std::any_of(scene->Materials.begin(), scene->Materials.end(),
             [](const auto& material) { return material.Model == Ray::MaterialModel::Dielectric; });

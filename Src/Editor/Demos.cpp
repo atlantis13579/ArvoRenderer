@@ -239,8 +239,21 @@ SceneSnapshot DemoCatalog::LoadModelDemo(
         scene.SceneCamera.Position = {-1.15f, -0.55f, 0.0f};
         scene.SceneCamera.Target = {1.6f, -0.45f, 0.0f};
         scene.SceneCamera.VerticalFieldOfViewDegrees = 72.0f;
-        scene.Lights.push_back(
-            {LightType::Directional, {}, {-0.35f, -1.0f, -0.25f}, {}, 3.0f, {}, true});
+        // The OBJ has textured diffuse reflectance and zero specular reflectance.
+        // Use the same Lambertian normalization in the preview and offline integrators.
+        for (auto& material : scene.Materials)
+            material.Scattering.Model = RayTracing::MaterialModel::Diffuse;
+
+        // Match the Evans atrium's warm sun across the roof opening. Two sky
+        // fills and a weaker floor bounce approximate its baked diffuse light
+        // for the direct-light preview. Only the sun casts a hard shadow.
+        scene.EnvironmentRadiance = {0.10f, 0.12f, 0.15f};
+        constexpr Color sky{0.85f, 0.92f, 1.0f, 1.0f};
+        scene.Lights = {
+            {LightType::Directional, {}, {0.55f, -1.0f, 1.25f}, {1.0f, 0.80f, 0.63f, 1.0f}, 2.0f, {}, true},
+            {LightType::Directional, {}, {0.55f, -1.5f, 1.0f}, sky, 2.2f, {}, false},
+            {LightType::Directional, {}, {0.55f, -1.5f, -1.0f}, sky, 2.2f, {}, false},
+            {LightType::Directional, {}, {-1.0f, 0.85f, 0.0f}, {1.0f, 0.9f, 0.8f, 1.0f}, 1.15f, {}, false}};
     }
     else
     {

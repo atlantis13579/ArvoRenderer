@@ -107,6 +107,7 @@ struct Material
     std::shared_ptr<const ImageAsset> DiffuseImage;
     std::shared_ptr<const ImageAsset> NormalImage;
     std::shared_ptr<const ImageAsset> OpacityImage;
+    bool ScatteringEdited = false;
 };
 
 using SceneNodeId = std::uint64_t;
@@ -168,6 +169,8 @@ struct SceneSnapshot
     std::vector<Light> Lights;
     std::vector<Material> Materials;
     std::vector<SceneNode> Nodes;
+    // Linear radiance seen through openings and by rays that escape the scene.
+    Float3 EnvironmentRadiance{0.02f, 0.02f, 0.025f};
 };
 
 enum class FillMode

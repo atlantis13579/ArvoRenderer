@@ -266,8 +266,8 @@ void RenderPanel::Start(EditorCore& editor)
         }
         for (uint32_t index = 0; index < editor.Scene().Materials.size(); ++index)
         {
-            const auto& scattering = editor.Scene().Materials[index].Scattering;
-            if (scattering != RayTracing::MaterialScattering{}) config.Materials.push_back({index, scattering});
+            const auto& material = editor.Scene().Materials[index];
+            if (material.ScatteringEdited) config.Materials.push_back({index, material.Scattering});
         }
         config.BvhPolicy = config.Acceleration == RayTracing::AccelerationType::Bvh
             ? static_cast<RayTracing::BvhBuildPolicy>(BvhPolicy_) : RayTracing::BvhBuildPolicy::Default;

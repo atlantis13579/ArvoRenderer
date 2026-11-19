@@ -391,7 +391,8 @@ namespace Arvo::Renderer
 				"ID3D11Device::CreateBlendState(alpha)", result));
 
 			D3D11_SAMPLER_DESC samplerDesc = {};
-			samplerDesc.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+			samplerDesc.Filter = D3D11_FILTER_ANISOTROPIC;
+			samplerDesc.MaxAnisotropy = 8;
 			samplerDesc.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
 			samplerDesc.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
 			samplerDesc.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
@@ -946,26 +947,28 @@ namespace Arvo::Renderer
 		}
 		else
 		{
+			const bool materialMips = initialData && !desc.RenderTarget && (desc.Width > 1 || desc.Height > 1);
 			D3D11_TEXTURE2D_DESC nativeDesc = {};
 			nativeDesc.Width = static_cast<UINT>(desc.Width);
 			nativeDesc.Height = static_cast<UINT>(desc.Height);
-			nativeDesc.MipLevels = 1;
+			nativeDesc.MipLevels = materialMips ? 0 : 1;
 			nativeDesc.ArraySize = 1;
 			nativeDesc.Format = DXGI_FORMAT_R8G8B8A8_TYPELESS;
 			nativeDesc.SampleDesc.Count = 1;
 			nativeDesc.Usage = D3D11_USAGE_DEFAULT;
 			nativeDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE
-				| (desc.RenderTarget ? D3D11_BIND_RENDER_TARGET : 0u);
-			D3D11_SUBRESOURCE_DATA data = {};
-			data.pSysMem = initialData;
-			data.SysMemPitch = static_cast<UINT>(desc.Width * 4);
-			HRESULT result = m_Impl->Device->CreateTexture2D(&nativeDesc, initialData ? &data : nullptr,
+				| ((desc.RenderTarget || materialMips) ? D3D11_BIND_RENDER_TARGET : 0u);
+			nativeDesc.MiscFlags = materialMips ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0u;
+			HRESULT result = m_Impl->Device->CreateTexture2D(&nativeDesc, nullptr,
 				resource.Texture.GetAddressOf());
 			if (FAILED(result))
 			{
 				m_Impl->Fail(HResultMessage("ID3D11Device::CreateTexture2D", result));
 				return {};
 			}
+			if (initialData)
+				m_Impl->Context->UpdateSubresource(resource.Texture.Get(), 0, nullptr, initialData,
+					static_cast<UINT>(desc.Width * 4), 0);
 			if (desc.RenderTarget)
 			{
 				D3D11_RENDER_TARGET_VIEW_DESC renderTargetDesc = {};
@@ -985,7 +988,7 @@ namespace Arvo::Renderer
 			D3D11_SHADER_RESOURCE_VIEW_DESC linearViewDesc = {};
 			linearViewDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
 			linearViewDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-			linearViewDesc.Texture2D.MipLevels = 1;
+			linearViewDesc.Texture2D.MipLevels = UINT(-1);
 			result = m_Impl->Device->CreateShaderResourceView(
 				resource.Texture.Get(), &linearViewDesc,
 				resource.ShaderResourceView.GetAddressOf());
@@ -1006,6 +1009,10 @@ namespace Arvo::Renderer
 					result));
 				return {};
 			}
+			// Filter albedo in linear light and keep normal/opacity channels linear.
+			if (materialMips)
+				m_Impl->Context->GenerateMips(desc.ColorSpace == TextureColorSpace::SRGB
+					? resource.SRGBShaderResourceView.Get() : resource.ShaderResourceView.Get());
 		}
 		const TextureHandle handle { m_Impl->NextTexture++ };
 		m_Impl->Textures.emplace(handle.Value, std::move(resource));
