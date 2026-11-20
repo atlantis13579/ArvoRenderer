@@ -1,92 +1,100 @@
 # Arvo
 
-Arvo is an educational renderer exploring offline light transport, physically
-based shading and interactive approximations. Its scenes include Cornell Box,
-Sponza and a Stanford Dragon study of glass, rough transmission and subsurface
+Arvo is an educational **distributed renderer** for light transport. Workers on
+different platforms can render tiles of the same image in parallel, and Arvo
+assembles them into the final frame. Offline rendering supports CPU, CUDA,
+DirectCompute, DXR, and Metal. Tiled rendering scales to distributed workers,
+render farms, and hybrid CPU/GPU jobs. Backends implement their own numerical
+algorithms and share configuration and scene data to preserve sample identity
+across tiles and retries. Stateful methods schedule complete photon passes,
+light-path populations, or Markov chains. Arvo also explores physically based
+shading and interactive approximations in scenes such as Cornell Box, Sponza,
+and a Stanford Dragon study of glass, rough transmission, and subsurface
 scattering.
+
+
+<img width="1280" height="1265" alt="cornell-path-bvh-default-flat-1795066065269" src="https://github.com/user-attachments/assets/42e68491-e7a9-4f48-b466-2beea4121820" />
+
 
 ## Light transport
 
+Arvo covers direct lighting, diffuse interreflection, specular transport, and caustics.
+Photon and point-based reconstruction trade bias for efficiency. Progressive photon
+methods reduce reconstruction bias as sampling increases.
+
+
+<img width="2692" height="1840" alt="comparison" src="https://github.com/user-attachments/assets/95281db2-bf81-4c35-9f8a-e570aa228005" />
+
+
 | Algorithm | Principle |
 | --- | --- |
-| Whitted-style ray tracing | Direct illumination with recursive specular reflection and refraction. |
-| Distributed ray tracing | Stochastic sampling of glossy surfaces, finite lights, lens aperture and shutter time. |
-| Path tracing | Monte Carlo integration of light transport along camera paths. |
-| Bidirectional path tracing (BDPT) | Connections between camera and light subpaths, combined with multiple importance sampling. |
-| Metropolis light transport (MLT) | Mutations in primary sample space concentrate exploration around contributing light paths. |
-| Vertex connection and merging (VCM) | Combines bidirectional connections with photon-style vertex merging under a common weighting scheme. |
-| Photon mapping | Light-emitted paths populate a density estimate for indirect illumination and caustics. |
-| Progressive photon mapping (PPM) | Repeated photon passes accumulate flux while progressively shrinking the reconstruction radius. |
-| Point-based global illumination | Surface samples store and gather approximate illumination through a spatial hierarchy. |
+| Whitted-style ray tracing | Direct lighting and recursive specular reflection and refraction. |
+| Distributed ray tracing | Stochastic sampling of glossy surfaces, finite lights, lens aperture, and shutter time. |
+| Path tracing | Monte Carlo integration along camera paths. |
+| Bidirectional path tracing (BDPT) | Connects camera and light subpaths with multiple importance sampling. |
+| Metropolis light transport (MLT) | Mutates samples in primary sample space to favor contributing light paths. |
+| Vertex connection and merging (VCM) | Weights bidirectional connections and photon-style vertex merging together. |
+| Photon mapping | Estimates indirect lighting and caustics from the density of photons traced from lights. |
+| Progressive photon mapping (PPM) | Accumulates flux across photon passes as the reconstruction radius shrinks. |
+| Point-based global illumination | Stores and gathers approximate illumination from surface samples in a spatial hierarchy. |
 
-These methods cover direct lighting, diffuse interreflection, specular transport
-and caustics. Photon and point-based reconstruction trade bias for efficiency;
-progressive photon methods reduce reconstruction bias as sampling increases.
+
+<img width="1136" height="2640" alt="detail-comparison" src="https://github.com/user-attachments/assets/f7c2879c-40f4-4976-ac37-f94f263f0a89" />
+
 
 ## Sampling and convergence
 
-- Importance sampling of scattering and light distributions.
-- Next event estimation (NEE) and multiple importance sampling (MIS), including
-  balance and power heuristics.
-- Independent random, stratified, Sobol quasi-Monte Carlo and procedural
-  blue-noise sampling.
+- Importance sampling for scattering and lights, next-event estimation (NEE), and multiple
+  importance sampling (MIS) with balance and power heuristics.
+- Independent random, stratified, Sobol quasi-Monte Carlo, and procedural blue-noise
+  sampling.
 - Russian roulette for stochastic path termination.
-- Adaptive sampling, variance estimation and denoiser-aware sample allocation.
+- Variance estimation, adaptive sampling, and denoiser-aware sample allocation.
 
-Sampling, transport and reconstruction are separate choices, subject to the
-estimator's compatibility constraints. Correlated Markov chains, progressive
-photon passes and independent path samples require different convergence models.
+Sampling, transport, and reconstruction are separate choices within estimator constraints.
+Independent path samples, correlated Markov chains, and progressive photon passes need
+different convergence models.
 
 ## Materials, media and camera effects
 
-Physically based surface scattering includes diffuse materials, conductors and
-dielectrics, GGX microfacet reflection and transmission, Fresnel response and
-importance sampling of visible microfacet normals.
+Surface scattering covers diffuse materials, conductors, and dielectrics, with GGX
+microfacet reflection and transmission, Fresnel response, and importance sampling of
+visible microfacet normals. Transport supports RGB and spectral modes, with spectral
+transport resolving wavelength-dependent light and material response.
 
-RGB and spectral transport represent wavelength-dependent light and material
-response. Subsurface scattering uses interior random walks. Homogeneous
-participating media support absorption, multiple scattering, Beer-Lambert
-transmittance and the Henyey-Greenstein phase function.
 
-Homogeneous participating media currently require path tracing. Subsurface walks
-require static, closed dielectric solids and full geometric shadow visibility;
-camera motion is supported. Whitted tracing supports diffuse and ideal specular
-surfaces. Point-based GI uses a view-independent diffuse cache, with subsurface
-walks for dielectric interiors.
+<img width="1280" height="720" alt="dragon-path-bvh-default-flat-1794290460079" src="https://github.com/user-attachments/assets/9d632b64-159e-4ec4-bd89-3a449f0f0622" />
 
-Thin-lens depth of field samples a finite aperture. Shutter-time sampling produces
-camera and rigid-object motion blur. Micropolygon dicing supports procedural
-displacement and fine geometric detail.
-Displacement is procedural; authored height maps and measured material spectra
-remain planned capabilities.
+
+- Homogeneous participating media require path tracing and support absorption, multiple
+  scattering, Beer-Lambert transmittance, and the Henyey-Greenstein phase function.
+- Subsurface random walks require static, closed dielectric solids and full geometric
+  shadow visibility. Camera motion is supported.
+- Whitted tracing supports diffuse and ideal specular surfaces. Point-based GI uses a
+  view-independent diffuse cache and supports subsurface walks in dielectrics.
+- Thin-lens depth of field samples a finite aperture. Shutter-time sampling produces
+  camera and rigid-object motion blur.
+- Micropolygon dicing supports fine geometry and procedural displacement. Authored height
+  maps and measured material spectra are planned.
 
 ## Geometry and acceleration
 
-Bounding volume hierarchies (BVH), spatial-split BVHs, k-d trees and bounding
-interval hierarchies (BIH) provide different spatial partitioning strategies.
-Instancing shares object geometry through bottom-level and top-level acceleration
-structures, with rays transformed into object space. Motion bounds cover geometry
-throughout the shutter interval.
+Spatial partitioning uses bounding volume hierarchies (BVHs), spatial-split BVHs, k-d
+trees, and bounding interval hierarchies (BIHs). Instancing shares geometry through
+bottom- and top-level acceleration structures and transforms rays into object space.
+Motion bounds span the shutter interval.
 
 ## Reconstruction
 
-Spatial a-trous filtering uses radiance variance and geometric guides. Temporal
-reconstruction reprojects history, rejects incompatible observations and clips
-outliers. Adaptive reconstruction couples uncertainty estimates to sampling.
-AI-based denoising remains a planned capability.
+Spatial a-trous filtering uses radiance variance and optional primary-surface guides. On
+RGB diffuse surfaces, it weights radiance and multisampled albedo together to preserve
+texture contrast while smoothing lighting noise. Temporal reconstruction reprojects
+history, rejects incompatible observations, and clips outliers. Adaptive reconstruction
+uses uncertainty estimates to allocate samples. AI denoising is planned.
 
-## Execution and preview
+## Interactive preview
 
-Offline rendering supports CPU, CUDA, DirectCompute, DXR and Metal. Tile-based
-execution extends to distributed workers, render farms and hybrid CPU/GPU jobs.
-Each backend owns its numerical algorithms. Shared configuration and scene data
-preserve sample identity across tiles and retries. Stateful methods schedule
-complete photon passes, light-path populations or Markov chains.
-
-DXR supports both offline transport and interactive ray-traced previews. Preview
-uses native viewport resolution with simplified lighting and short reflection
-and refraction paths. DX11 provides a raster preview with physical shading,
-shadow maps and approximate environment lighting. Preview favors responsiveness;
-offline rendering provides the more complete light transport model.
-
-[Asset credits](Contents/ATTRIBUTION.md)
+DXR previews trace short reflection and refraction paths at native viewport resolution
+with simplified lighting. DX11 raster previews use physical shading, shadow maps, and
+approximate environment lighting. Previews prioritize responsiveness. Offline rendering
+models light transport more fully.
