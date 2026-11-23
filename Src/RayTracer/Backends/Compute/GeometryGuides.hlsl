@@ -44,7 +44,7 @@ cbuffer GuideControls : register(b0)
     float MaximumDistance;
     uint4 Reserved;
 };
-static const uint Threads = 64, MaximumExtent = 16384, BadConfiguration = 1, BadValue = 2;
+static const uint Threads = 64, MaximumExtent = 32768, BadConfiguration = 1, BadValue = 2;
 static const uint Surface = 1, Background = 2, Front = 4, InvalidPrimitive = 0xffffffffu;
 static const float Pi = 3.14159265358979323846f, HalfTurn = 180, Center = 0.5f;
 float3 GuideUnit(float3 v)

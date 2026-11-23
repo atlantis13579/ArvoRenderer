@@ -13,6 +13,8 @@ struct RawPixel
     float GuideDepth;
     float3 GuideNormal;
     float ReservedNormal;
+    float3 DiffuseAlbedo;
+    float ReservedAlbedo;
 };
 StructuredBuffer<RawPixel> Film : register(t0);
 StructuredBuffer<float4> Prior : register(t1);
@@ -148,6 +150,8 @@ void SpatialDenoiseRayGen() {
     const double3 center = Source(address);
     const double noise = Deviation(address);
     double3 average = 0;
+    const bool diffuse = Film[address].DiffuseAlbedo.x >= 0;
+    double3 albedoSum = 0;
     double normalization = 0;
     for (int vertical = -KernelRadius; vertical <= KernelRadius; ++vertical)
         for (int horizontal = -KernelRadius; horizontal <= KernelRadius; ++horizontal)
@@ -156,12 +160,16 @@ void SpatialDenoiseRayGen() {
             if (sx < 0 || sy < 0 || sx >= int(FilmWidth) || sy >= int(FilmHeight))
                 continue;
             const uint location = uint(sy) * FilmWidth + uint(sx);
+            if (diffuse != (Film[location].DiffuseAlbedo.x >= 0))
+                continue;
             const double3 neighbor = Source(location);
             const double weight = Kernel(vertical) * Kernel(horizontal) *
                                   Similarity(center, neighbor, noise, Deviation(location)) *
                                   SurfaceAgreement(address, location);
             if (!(weight > 0))
                 continue;
+            if (diffuse)
+                albedoSum += weight * double3(Film[location].DiffuseAlbedo);
             const double preceding = normalization;
             normalization += weight;
             // Keep the small weight directly; 1 - a nearly unit blend loses
@@ -170,6 +178,16 @@ void SpatialDenoiseRayGen() {
                 ? neighbor + (average - neighbor) * (preceding / normalization)
                 : average + (neighbor - average) * (weight / normalization);
         }
+    if (diffuse && normalization > 0)
+    {
+        static const double AlbedoFloor = 0.001;
+        const double3 ratio = (double3(Film[address].DiffuseAlbedo) + AlbedoFloor) /
+                              (albedoSum / normalization + AlbedoFloor);
+        const double3 adjusted = average * ratio;
+        for (uint channel = 0; channel < 3; ++channel)
+            if (isfinite(float(adjusted[channel])))
+                average[channel] = adjusted[channel];
+    }
     const float3 radiance = float3(average);
     if (normalization <= 0 || any(!isfinite(radiance)))
     {

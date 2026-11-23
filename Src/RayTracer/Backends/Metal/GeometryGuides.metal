@@ -43,7 +43,7 @@ struct GeometryGuidePixel
 static_assert(sizeof(GeometryGuideControls) == 96 && sizeof(GeometryGuideRay) == 32 &&
                   sizeof(GeometryGuideHit) == 64 && sizeof(GeometryGuidePixel) == 64,
               "Metal geometry guide ABI");
-constant uint GuideMaximumExtent = 16384, GuideBadWindow = 1, GuideBadValue = 2;
+constant uint GuideMaximumExtent = 32768, GuideBadWindow = 1, GuideBadValue = 2;
 constant uint GuideSurface = 1, GuideBackground = 2, GuideFront = 4, GuideNoPrimitive = 0xffffffffu;
 constant float GuidePi = 3.14159265358979323846f, GuideHalfTurn = 180, GuidePixelCenter = 0.5f;
 float3 GeometryGuideUnit(float3 v)

@@ -27,8 +27,7 @@ namespace RayTracing
 
     bool ValidateRayQueries(const std::vector<Ray>& rays, std::string& error)
     {
-        constexpr size_t MaximumQueryBatch = 1u << 20;
-        if (rays.size() > MaximumQueryBatch)
+        if (rays.size() > MaximumRayQueryBatch)
         {
             error = "A native ray-query batch may contain at most 1048576 rays.";
             return false;

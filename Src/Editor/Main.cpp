@@ -1,3 +1,4 @@
+#include "Lightmap/Baker.h"
 #include "Core/Paths.h"
 #include "Editor/ModuleAdapters.h"
 #include "Editor/EditorPresenter.h"
@@ -514,10 +515,28 @@ int RunWindow(HINSTANCE instance, int showCommand, Arvo::Editor::DemoId demo)
 }
 
 }
+int RunLightmap(int,char**);
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
 {
     try
     {
+        int commandCount=0;
+        LPWSTR* commandArgs=CommandLineToArgvW(GetCommandLineW(),&commandCount);
+        if(commandArgs && commandCount>1 && std::wstring(commandArgs[1])==L"--bake-lightmap")
+        {
+            std::vector<std::string> strings; std::vector<char*> arguments;
+            for(int i=0;i<commandCount;++i)
+            {
+                const int size=WideCharToMultiByte(CP_UTF8,0,commandArgs[i],-1,nullptr,0,nullptr,nullptr);
+                std::string value(size,'\0');
+                WideCharToMultiByte(CP_UTF8,0,commandArgs[i],-1,value.data(),size,nullptr,nullptr);
+                value.pop_back(); strings.push_back(std::move(value));
+            }
+            LocalFree(commandArgs);
+            for(auto& value:strings) arguments.push_back(value.data());
+            return RunLightmap(commandCount,arguments.data());
+        }
+        if(commandArgs) LocalFree(commandArgs);
         // Keep client coordinates in physical pixels; Windows bitmap scaling
         // would otherwise blur even a full-resolution DXR viewport on HiDPI displays.
         if (!SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2))

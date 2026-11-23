@@ -100,7 +100,7 @@ namespace RayTracing
                             {
                                 guides = spatialGuides.Get(
                                     raster,
-                                    [&] { return CaptureGuidesNative(*scene, camera, raster, cancelled); },
+                                    [&] { return CaptureGuidesNative(*scene, camera, raster, cancelled, true); },
                                     error);
                                 if (!guides)
                                     return false;
@@ -129,10 +129,10 @@ namespace RayTracing
 
         GeometryGuideResult CaptureGuidesNative(const Scene &scene, const Camera &camera,
                                                 const RenderSettings &settings,
-                                                const Detail::CancellationProbe &stopped) const
+                                                const Detail::CancellationProbe &stopped, bool spatialAlbedo = false) const
         {
             return Detail::CaptureGeometryGuides(
-                scene, camera, settings, stopped, [&](const auto &controls, auto &rays, auto &error)
+                scene, camera, settings, spatialAlbedo, stopped, [&](const auto &controls, auto &rays, auto &error)
                 { return Cpu::GenerateGeometryGuideRays(controls, stopped, rays, error); },
                 [&](const auto &rays)
                 { return QueryNative(scene, rays, {settings.Acceleration, settings.BvhPolicy}, stopped); },

@@ -13,6 +13,8 @@ struct FilmInput
     float GuideDepth;
     float3 GuideNormal;
     float ReservedNormal;
+    float3 DiffuseAlbedo;
+    float ReservedAlbedo;
 };
 StructuredBuffer<FilmInput> Raw : register(t0);
 StructuredBuffer<float4> Previous : register(t1);
@@ -127,6 +129,8 @@ uint DisplayColor(float3 color)
     const double3 center = ReadColor(index);
     const double variance = NoiseVariance(index);
     double3 mean = 0;
+    const bool diffuse = Raw[index].DiffuseAlbedo.x >= 0;
+    double3 albedoSum = 0;
     double totalWeight = 0;
     for (uint tap = 0; tap < StencilWidth * StencilWidth; ++tap)
     {
@@ -135,12 +139,16 @@ uint DisplayColor(float3 color)
         if (any(pixel < 0) || pixel.x >= int(Width) || pixel.y >= int(Height))
             continue;
         const uint neighbor = uint(pixel.y) * Width + uint(pixel.x);
+        if (diffuse != (Raw[neighbor].DiffuseAlbedo.x >= 0))
+            continue;
         const double3 color = ReadColor(neighbor);
         const double weight =
             Stencil[column] * Stencil[row] * RangeWeight(center, color, variance + NoiseVariance(neighbor)) *
             GeometryWeight(index, neighbor);
         if (weight <= 0)
             continue;
+        if (diffuse)
+            albedoSum += weight * double3(Raw[neighbor].DiffuseAlbedo);
         const double previousWeight = totalWeight;
         totalWeight += weight;
         // Anchor at the heavier endpoint to retain tiny contributions when a
@@ -149,6 +157,16 @@ uint DisplayColor(float3 color)
             mean = color + (mean - color) * (previousWeight / totalWeight);
         else
             mean += (color - mean) * (weight / totalWeight);
+    }
+    if (diffuse && totalWeight > 0)
+    {
+        static const double AlbedoFloor = 0.001;
+        const double3 ratio = (double3(Raw[index].DiffuseAlbedo) + AlbedoFloor) /
+                              (albedoSum / totalWeight + AlbedoFloor);
+        const double3 adjusted = mean * ratio;
+        for (uint channel = 0; channel < 3; ++channel)
+            if (isfinite(float(adjusted[channel])))
+                mean[channel] = adjusted[channel];
     }
     const float3 result = float3(mean);
     if (!(totalWeight > 0) || any(!isfinite(result)))

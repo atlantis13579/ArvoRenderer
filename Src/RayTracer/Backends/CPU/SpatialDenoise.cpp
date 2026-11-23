@@ -105,6 +105,7 @@ bool SpatialDenoise(const LinearFilm &film, const ReconstructionOptions &options
         output.Pixels.push_back(film.Pixels[index].MeanRadiance);
         noise.push_back(Dispersion(film.Pixels[index], useMoments));
     }
+    const bool hasAlbedo = options.GeometryGuidance && guides && !guides->DiffuseAlbedo.empty();
     std::vector<Float3> next(output.Pixels.size());
     const uint32_t passes = options.Filter == ReconstructionFilter::None ? 0 : options.Passes;
     for (uint32_t pass = 0; pass < passes; ++pass)
@@ -121,7 +122,8 @@ bool SpatialDenoise(const LinearFilm &film, const ReconstructionOptions &options
             {
                 const size_t index = size_t(y) * film.Width + x;
                 const Color center = Wide(output.Pixels[index]);
-                Color mean{};
+                const bool diffuse = hasAlbedo && guides->DiffuseAlbedo[index].X >= 0;
+                Color mean{}, albedoSum{};
                 double totalWeight = 0;
                 for (int dy = -Radius; dy <= Radius; ++dy)
                 {
@@ -134,6 +136,8 @@ bool SpatialDenoise(const LinearFilm &film, const ReconstructionOptions &options
                         if (sampleX < 0 || sampleX >= film.Width)
                             continue;
                         const size_t neighborIndex = size_t(sampleY) * film.Width + size_t(sampleX);
+                        if (hasAlbedo && diffuse != (guides->DiffuseAlbedo[neighborIndex].X >= 0))
+                            continue;
                         const Color neighbor = Wide(output.Pixels[neighborIndex]);
                         const double weight =
                             B3Weights[size_t(dx + Radius)] * B3Weights[size_t(dy + Radius)] *
@@ -144,6 +148,12 @@ bool SpatialDenoise(const LinearFilm &film, const ReconstructionOptions &options
                                  : 1);
                         if (!(weight > 0))
                             continue;
+                        if (diffuse)
+                        {
+                            const auto albedo = Wide(guides->DiffuseAlbedo[neighborIndex]);
+                            for (size_t c = 0; c < mean.size(); ++c)
+                                albedoSum[c] += weight * albedo[c];
+                        }
                         const double previousWeight = totalWeight;
                         totalWeight += weight;
                         // Update about the heavier endpoint. Subtracting almost
@@ -154,6 +164,21 @@ bool SpatialDenoise(const LinearFilm &film, const ReconstructionOptions &options
                             mean[channel] = incomingDominates
                                 ? neighbor[channel] + (mean[channel] - neighbor[channel]) * fraction
                                 : mean[channel] + (neighbor[channel] - mean[channel]) * fraction;
+                    }
+                }
+                // For L = albedo * irradiance, normalize the radiance and albedo
+                // with identical weights. The floor regularizes near-black channels.
+                if (diffuse && totalWeight > 0)
+                {
+                    constexpr double AlbedoFloor = 0.001;
+                    const auto centerAlbedo = Wide(guides->DiffuseAlbedo[index]);
+                    for (size_t c = 0; c < mean.size(); ++c)
+                    {
+                        const double ratio = (centerAlbedo[c] + AlbedoFloor) /
+                                             (albedoSum[c] / totalWeight + AlbedoFloor);
+                        const double adjusted = mean[c] * ratio;
+                        if (std::abs(adjusted) <= std::numeric_limits<float>::max())
+                            mean[c] = adjusted;
                     }
                 }
                 if (!(totalWeight > 0) || !std::isfinite(mean[0]) || !std::isfinite(mean[1]) ||

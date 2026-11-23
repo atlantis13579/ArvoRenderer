@@ -166,7 +166,7 @@ struct CameraFrame
     MotionData::Exposure Motion;
 };
 
-Float3 SampleDiffuseTexture(const Scene& scene, uint32_t textureIndex, const Float2& texCoord) noexcept;
+using Detail::SampleDiffuseTexture;
 Float3 Background(const Scene& scene, const Ray& ray);
 void AccumulateFilmSample(FilmPixel& pixel, const Float3& radiance);
 

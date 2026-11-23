@@ -16,6 +16,8 @@ struct alignas(16) Pixel
     float GuideDepth = 0;
     Float3 GuideNormal;
     float ReservedNormal = 0;
+    Float3 DiffuseAlbedo{-1, -1, -1};
+    float ReservedAlbedo = 0;
 };
 struct alignas(16) Controls
 {
@@ -26,9 +28,9 @@ struct alignas(16) Controls
     uint32_t GammaCorrection;
     float NormalScale = 0.25f, RelativePlaneScale = 0.01f;
 };
-static_assert(sizeof(Pixel) == 64 && offsetof(Pixel, Samples) == 16 && offsetof(Pixel, GuidePosition) == 32);
+static_assert(sizeof(Pixel) == 80 && offsetof(Pixel, DiffuseAlbedo) == 64 && offsetof(Pixel, Samples) == 16 && offsetof(Pixel, GuidePosition) == 32);
 static_assert(sizeof(Controls) == 48 && offsetof(Controls, AbsoluteColorScale) == 32);
-void PackGuide(Pixel &, const GeometryGuide &);
+void PackGuide(Pixel &, const GeometryGuideImage &, size_t index);
 } // namespace ReconstructionData
 bool ValidateReconstructionInput(const LinearFilm&, const ReconstructionOptions&, std::string& error);
 bool ValidateReconstructionSupport(const Camera &, bool sceneMotion, const ReconstructionOptions &,

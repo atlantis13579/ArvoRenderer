@@ -629,7 +629,7 @@ struct MetalRayTracingRHI::Impl
                             {
                                 guides = spatialGuides.Get(
                                     raster,
-                                    [&] { return CaptureGuidesNative(*scene, camera, raster, cancellation); },
+                                    [&] { return CaptureGuidesNative(*scene, camera, raster, cancellation, true); },
                                     error);
                                 if (!guides)
                                     return false;
@@ -3226,10 +3226,10 @@ struct MetalRayTracingRHI::Impl
 
     GeometryGuideResult CaptureGuidesNative(const Scene &scene, const Camera &camera,
                                             const RenderSettings &settings,
-                                            const Detail::CancellationProbe &stopped) const
+                                            const Detail::CancellationProbe &stopped, bool spatialAlbedo = false) const
     {
         return Detail::CaptureGeometryGuides(
-            scene, camera, settings, stopped, [&](const auto &controls, auto &rays, auto &error)
+            scene, camera, settings, spatialAlbedo, stopped, [&](const auto &controls, auto &rays, auto &error)
             { return GeometryGuideStage(controls, {}, {}, stopped, rays, error); }, [&](const auto &rays)
             { return QueryNative(scene, rays, {settings.Acceleration, settings.BvhPolicy}, stopped); },
             [&](const auto &controls, const auto &rays, const auto &hits, auto &guides, auto &error)
@@ -3262,7 +3262,7 @@ struct MetalRayTracingRHI::Impl
             input.push_back({pixel.MeanRadiance.X, pixel.MeanRadiance.Y, pixel.MeanRadiance.Z,
                              pixel.LuminanceM2, pixel.SampleCount});
             if (guides)
-                Data::PackGuide(input.back(), guides->Pixels[input.size() - 1]);
+                Data::PackGuide(input.back(), *guides, input.size() - 1);
         }
         Buffer raw, previous, next, display, failures;
         if (!CreateVectorBuffer(raw, input, "Arvo Metal reconstruction raw film", error) ||

@@ -44,7 +44,7 @@ cbuffer GeometryGuideControls : register(b0)
     float FarDistance;
     uint4 Padding;
 };
-static const uint ExtentLimit = 16384, InvalidDispatch = 1, InvalidValue = 2;
+static const uint ExtentLimit = 32768, InvalidDispatch = 1, InvalidValue = 2;
 static const uint SurfaceFlag = 1, SkyFlag = 2, FrontFlag = 4, NoPrimitive = 0xffffffffu;
 static const float Pi = 3.14159265358979323846f, DegreesPerHalfTurn = 180;
 float3 NormalizedGuide(float3 v)

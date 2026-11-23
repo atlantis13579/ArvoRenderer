@@ -138,6 +138,7 @@ struct Bounds
     case DemoId::CornellBox:
         return "Scenes/CornellBox/CornellBox-Original.obj";
     case DemoId::SponzaAtrium:
+    case DemoId::SponzaGallery:
         return "Scenes/Sponza/sponza.obj";
     case DemoId::StanfordDragon:
         return "Scenes/Dragon/Dragon_80K.obj";
@@ -158,7 +159,8 @@ const std::vector<DemoDescriptor>& DemoCatalog::Descriptors()
         {DemoId::CornellBox, "cornell", "Cornell Box", "A compact scene for shadows and light transport."},
         {DemoId::SponzaAtrium, "sponza", "Sponza Atrium", "A detailed architectural stress scene."},
         {DemoId::StanfordDragon, "dragon", "Stanford Dragon",
-         "Clear glass, frosted refraction and subsurface scattering in a ceiling-lit Cornell room."}};
+         "Clear glass, frosted refraction and subsurface scattering in a ceiling-lit Cornell room."},
+        {DemoId::SponzaGallery, "sponza-gallery", "Sponza Gallery", "Indirect daylight in the upper arcade."}};
     return descriptors;
 }
 
@@ -201,7 +203,7 @@ SceneSnapshot DemoCatalog::LoadModelDemo(
     scene.Revision = 1;
     scene.Materials = std::move(model.Materials);
 
-    const float targetExtent = demo == DemoId::SponzaAtrium ? 5.0f : 3.0f;
+    const float targetExtent = IsSponza(demo) ? 5.0f : 3.0f;
     const Transform frameTransform = FrameTransform(ComputeBounds(model.Geometry.Meshes), targetExtent);
     SceneNodeId nodeId = 1;
     for (MeshAsset& mesh : model.Geometry.Meshes)
@@ -232,18 +234,35 @@ SceneSnapshot DemoCatalog::LoadModelDemo(
         scene.SceneCamera.Target = {0.0f, 0.0f, 0.0f};
         scene.Lights.push_back(CornellEmitter(scene));
     }
-    else if (demo == DemoId::SponzaAtrium)
+    else if (IsSponza(demo))
     {
+        for (auto& material : scene.Materials)
+        {
+            material.Scattering.Model = RayTracing::MaterialModel::Diffuse;
+            if (demo == DemoId::SponzaGallery && material.Name == "floor")
+            {
+                material.Scattering.Model = RayTracing::MaterialModel::Conductor;
+                material.Scattering.MicrofacetSlope = 0.018f;
+            }
+        }
+
+        if (demo == DemoId::SponzaGallery)
+        {
+            // Frame both the open arcade and its sheltered vault at one indoor exposure.
+            scene.SceneCamera.Position = {-0.21f, -0.12f, 0.67f};
+            scene.SceneCamera.Target = {0.59f, -0.24f, 0.34f};
+            scene.SceneCamera.VerticalFieldOfViewDegrees = 67.0f;
+            scene.EnvironmentRadiance = {98.4f, 108.0f, 120.0f};
+            scene.Lights.push_back({LightType::Directional, {}, {0.38f, -1.0f, 0.49f},
+                                    {1.0f, 0.88f, 0.73f, 1.0f}, 12.0f, {}, true});
+            return scene;
+        }
+
         // Place the camera at human height inside the centered atrium and look
         // along its main colonnade instead of at the mostly closed exterior.
         scene.SceneCamera.Position = {-1.15f, -0.55f, 0.0f};
         scene.SceneCamera.Target = {1.6f, -0.45f, 0.0f};
         scene.SceneCamera.VerticalFieldOfViewDegrees = 72.0f;
-        // The OBJ has textured diffuse reflectance and zero specular reflectance.
-        // Use the same Lambertian normalization in the preview and offline integrators.
-        for (auto& material : scene.Materials)
-            material.Scattering.Model = RayTracing::MaterialModel::Diffuse;
-
         // Match the Evans atrium's warm sun across the roof opening. Two sky
         // fills and a weaker floor bounce approximate its baked diffuse light
         // for the direct-light preview. Only the sun casts a hard shadow.

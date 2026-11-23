@@ -33,7 +33,8 @@ using TraceGuideRays = std::function<RayQueryResult(const std::vector<Ray>&)>;
 using ResolveGeometryGuides =
     std::function<bool(const GeometryGuideData::Controls&, const std::vector<GeometryGuideData::EncodedRay>&,
                        const std::vector<RayQueryHit>&, std::vector<GeometryGuide>&, std::string&)>;
-GeometryGuideResult CaptureGeometryGuides(const Scene&, const Camera&, const RenderSettings&, const CancellationProbe&,
+GeometryGuideResult CaptureGeometryGuides(const Scene&, const Camera&, const RenderSettings&, bool spatialAlbedo,
+                                          const CancellationProbe&,
                                           const GenerateGuideRays&, const TraceGuideRays&,
                                           const ResolveGeometryGuides&);
 } // namespace Detail

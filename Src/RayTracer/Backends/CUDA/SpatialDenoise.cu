@@ -6,6 +6,7 @@
 // Raw film stays unchanged. Compile this handwritten CUDA unit directly.
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cfloat>
 #include <cstdint>
 
 namespace
@@ -21,6 +22,8 @@ struct alignas(16) FilmInput
     float GuideDepth;
     float3 GuideNormal;
     float ReservedNormal;
+    float3 DiffuseAlbedo;
+    float ReservedAlbedo;
 };
 struct alignas(16) Controls
 {
@@ -29,7 +32,7 @@ struct alignas(16) Controls
     unsigned GammaCorrection;
     float NormalScale, RelativePlaneScale;
 };
-static_assert(sizeof(FilmInput) == 64 && sizeof(Controls) == 48);
+static_assert(sizeof(FilmInput) == 80 && sizeof(Controls) == 48);
 __device__ double3 ReadColor(const FilmInput* raw, const float4* previous, unsigned index, unsigned pass)
 {
     const float4 value = pass ? previous[index] : raw[index].RadianceMoment;
@@ -84,6 +87,12 @@ __device__ double GeometrySimilarity(const FilmInput& a, const FilmInput& b, con
                             normalDelta.z * normalDelta.z) / (double(controls.NormalScale) * controls.NormalScale);
     return exp(-(angular + planeDistance * planeDistance) / 2);
 }
+__device__ double RestoreDiffuse(double mean, float centerAlbedo, double averageAlbedo)
+{
+    constexpr double AlbedoFloor = 0.001;
+    const double value = mean * ((centerAlbedo + AlbedoFloor) / (averageAlbedo + AlbedoFloor));
+    return fabs(value) <= FLT_MAX ? value : mean;
+}
 __device__ unsigned Display(double3 color, unsigned gamma)
 {
     constexpr double SrgbKnee = 0.0031308, SrgbLinear = 12.92, SrgbScale = 1.055;
@@ -122,6 +131,8 @@ extern "C" __global__ void ArvoSpatialDenoise(const FilmInput* raw, const float4
     const double3 center = ReadColor(raw, previous, index, controls.Pass);
     const double centerNoise = Noise(raw[index], controls.Flags);
     double3 mean = make_double3(0, 0, 0);
+    const bool diffuse = raw[index].DiffuseAlbedo.x >= 0;
+    double3 albedoSum = make_double3(0, 0, 0);
     double sum = 0;
     for (int row = -int(StencilRadius); row <= int(StencilRadius); ++row)
     {
@@ -134,6 +145,8 @@ extern "C" __global__ void ArvoSpatialDenoise(const FilmInput* raw, const float4
             if (sampleX < 0 || sampleX >= controls.Width)
                 continue;
             const unsigned neighborIndex = unsigned(sampleY) * controls.Width + unsigned(sampleX);
+            if (diffuse != (raw[neighborIndex].DiffuseAlbedo.x >= 0))
+                continue;
             const double3 value = ReadColor(raw, previous, neighborIndex, controls.Pass);
             const double weight =
                 B3(row) * B3(column) *
@@ -141,6 +154,12 @@ extern "C" __global__ void ArvoSpatialDenoise(const FilmInput* raw, const float4
                 GeometrySimilarity(raw[index], raw[neighborIndex], controls);
             if (!(weight > 0))
                 continue;
+            if (diffuse)
+            {
+                albedoSum.x += weight * raw[neighborIndex].DiffuseAlbedo.x;
+                albedoSum.y += weight * raw[neighborIndex].DiffuseAlbedo.y;
+                albedoSum.z += weight * raw[neighborIndex].DiffuseAlbedo.z;
+            }
             const double previous = sum;
             sum += weight;
             // Blend toward the lighter endpoint from the dominant endpoint;
@@ -160,6 +179,12 @@ extern "C" __global__ void ArvoSpatialDenoise(const FilmInput* raw, const float4
                 mean.z += (value.z - mean.z) * incoming;
             }
         }
+    }
+    if (diffuse && sum > 0)
+    {
+        mean.x = RestoreDiffuse(mean.x, raw[index].DiffuseAlbedo.x, albedoSum.x / sum);
+        mean.y = RestoreDiffuse(mean.y, raw[index].DiffuseAlbedo.y, albedoSum.y / sum);
+        mean.z = RestoreDiffuse(mean.z, raw[index].DiffuseAlbedo.z, albedoSum.z / sum);
     }
     if (!(sum > 0) || !isfinite(mean.x) || !isfinite(mean.y) || !isfinite(mean.z))
     {

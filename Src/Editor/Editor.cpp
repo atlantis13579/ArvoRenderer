@@ -328,7 +328,7 @@ void EditorCore::SetPreviewIntegrator(
     RayTracing::MediumOptions medium, RayTracing::RadiometryMode radiometry)
 {
     samples = std::clamp(samples, 1U, 64U);
-    bounces = std::clamp(bounces, 1U, 16U);
+    bounces = std::min(bounces, 16U);
     std::string error;
     if (!RayTracing::ValidateTransportOptions(integrator, transport, error)) throw std::invalid_argument(error);
     if (!RayTracing::ValidateCameraMotionSupport(integrator, Scene_.SceneCamera.Motion, error))

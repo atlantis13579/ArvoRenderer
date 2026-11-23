@@ -14,8 +14,11 @@ constexpr float MinimumGeometryScale = 1e-6f, MaximumNormalScale = 2, MaximumPla
 constexpr uint32_t StencilRadius = 2;
 constexpr uint32_t MaximumExtent = 16384;
 } // namespace
-void ReconstructionData::PackGuide(Pixel &target, const GeometryGuide &source)
+void ReconstructionData::PackGuide(Pixel &target, const GeometryGuideImage &image, size_t index)
 {
+    const auto &source = image.Pixels[index];
+    if (!image.DiffuseAlbedo.empty())
+        target.DiffuseAlbedo = image.DiffuseAlbedo[index];
     target.GuideFlags = source.Flags;
     target.GuideMaterial = source.MaterialIndex;
     target.GuidePosition = source.Position;
@@ -138,6 +141,18 @@ bool ValidateReconstructionGuides(const LinearFilm &film, const ReconstructionOp
         error = "Spatial reconstruction requires matching static pinhole geometry guides";
         return false;
     }
+    if (!guides->DiffuseAlbedo.empty() && guides->DiffuseAlbedo.size() != film.Pixels.size())
+    {
+        error = "Spatial diffuse albedo must match the reconstruction raster";
+        return false;
+    }
+    for (auto a : guides->DiffuseAlbedo)
+        if (!(a.X == -1 && a.Y == -1 && a.Z == -1) &&
+            !(a.X >= 0 && a.X <= 1 && a.Y >= 0 && a.Y <= 1 && a.Z >= 0 && a.Z <= 1))
+        {
+            error = "Invalid spatial diffuse albedo";
+            return false;
+        }
     constexpr double NormalLengthTolerance = 0.001;
     constexpr uint32_t Classification = GeometryGuide::Surface | GeometryGuide::Background;
     constexpr uint32_t KnownFlags = Classification | GeometryGuide::FrontFace;

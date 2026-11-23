@@ -9,7 +9,7 @@
 namespace
 {
 constexpr float Pi = 3.14159265358979323846f, HalfTurnDegrees = 180, PixelMidpoint = 0.5f;
-constexpr unsigned MaximumExtent = 16384, InvalidConfiguration = 1, InvalidGeometry = 2;
+constexpr unsigned MaximumExtent = 32768, InvalidConfiguration = 1, InvalidGeometry = 2;
 constexpr unsigned Surface = 1, Background = 2, Front = 4, InvalidPrimitive = 0xffffffffu;
 struct alignas(16) GuideControls
 {

@@ -725,7 +725,10 @@ void RenderPanel::Draw(EditorCore& editor, int height)
     const char* reconstructionLabels[] = {"Off", "Spatial a-trous"};
     int reconstruction = static_cast<int>(Reconstruction_.Filter);
     if (imguiCombo("Denoising", &reconstruction, reconstructionLabels, int(std::size(reconstructionLabels))))
+    {
         Reconstruction_.Filter = static_cast<RayTracing::ReconstructionFilter>(reconstruction);
+        Reconstruction_.GeometryGuidance = Reconstruction_.Filter == RayTracing::ReconstructionFilter::SpatialAtrous;
+    }
     if (Reconstruction_.Filter == RayTracing::ReconstructionFilter::SpatialAtrous)
     {
         constexpr float MinimumPasses = 1, MaximumPasses = 5, PassStep = 1;
@@ -757,7 +760,7 @@ void RenderPanel::Draw(EditorCore& editor, int height)
             float plane = Reconstruction_.RelativePlaneScale * Percent;
             if (imguiSlider("Plane tolerance %", &plane, MinimumPlanePercent, Percent, PlaneStep))
                 Reconstruction_.RelativePlaneScale = plane / Percent;
-            DrawMessage("Normal, surface plane and material edges guide smoothing");
+            DrawMessage("Diffuse albedo, normals and material edges guide smoothing");
         }
         else if (!geometryAvailable)
             DrawMessage("Geometry guidance requires depth of field, motion and participating media off");
@@ -896,7 +899,7 @@ void RenderPanel::Draw(EditorCore& editor, int height)
     if (!offlineTemporalAvailable) Temporal_.Enabled = false;
     const bool adaptiveActive = Adaptive_.Enabled && adaptiveSupported;
     const float minimumSamples = adaptiveActive ? static_cast<float>(Adaptive_.MinimumSamples) : 1.0f;
-    imguiSlider("Max bounces", &Bounces_, 1, 12, 1);
+    imguiSlider("Max bounces", &Bounces_, 0, 12, 1);
     const bool path = algorithm == RayTracing::Algorithm::PathTracing || markov || photon || vcm;
     if (bidirectional) imguiValue("BDPT: fixed passes, full visibility");
     if (imguiCheck("Importance sampling", Transport_.ImportanceSampling, path || bidirectional || pointGi))

@@ -16,6 +16,8 @@ namespace Detail
 {
     using CancellationProbe = std::function<bool()>;
 
+    Float3 SampleDiffuseTexture(const Scene&, uint32_t textureIndex, const Float2&) noexcept;
+
     // Rendering capabilities are separate from geometry-only ray queries.
     bool ValidateMaterialTransport(const Scene& scene, BackendType backend,
         Algorithm algorithm, std::string& error);

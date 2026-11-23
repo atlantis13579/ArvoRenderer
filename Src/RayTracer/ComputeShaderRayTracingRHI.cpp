@@ -1135,7 +1135,7 @@ namespace RayTracing
                             {
                                 guides = spatialGuides.Get(
                                     raster,
-                                    [&] { return CaptureGuidesNative(*scene, camera, raster, cancellation); },
+                                    [&] { return CaptureGuidesNative(*scene, camera, raster, cancellation, true); },
                                     error);
                                 if (!guides)
                                     return false;
@@ -3715,10 +3715,10 @@ namespace RayTracing
 
         GeometryGuideResult CaptureGuidesNative(const Scene &scene, const Camera &camera,
                                                 const RenderSettings &settings,
-                                                const Detail::CancellationProbe &stopped) const
+                                                const Detail::CancellationProbe &stopped, bool spatialAlbedo = false) const
         {
             return Detail::CaptureGeometryGuides(
-                scene, camera, settings, stopped, [&](const auto &controls, auto &rays, auto &error)
+                scene, camera, settings, spatialAlbedo, stopped, [&](const auto &controls, auto &rays, auto &error)
                 { return GeometryGuideStage(controls, {}, {}, stopped, rays, error); }, [&](const auto &rays)
                 { return QueryNative(scene, rays, {settings.Acceleration, settings.BvhPolicy}, stopped); },
                 [&](const auto &controls, const auto &rays, const auto &hits, auto &guides, auto &error)
@@ -3753,7 +3753,7 @@ namespace RayTracing
                 input.push_back({pixel.MeanRadiance.X, pixel.MeanRadiance.Y, pixel.MeanRadiance.Z,
                                  pixel.LuminanceM2, pixel.SampleCount});
                 if (guides)
-                    Data::PackGuide(input.back(), guides->Pixels[input.size() - 1]);
+                    Data::PackGuide(input.back(), *guides, input.size() - 1);
             }
             const uint32_t pixels = uint32_t(input.size());
             const uint64_t inputBytes = uint64_t(pixels) * sizeof(Data::Pixel);

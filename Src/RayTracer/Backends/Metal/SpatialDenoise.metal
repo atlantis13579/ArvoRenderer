@@ -14,6 +14,8 @@ struct DenoisePixel
     float GuideDepth;
     packed_float3 GuideNormal;
     float ReservedNormal;
+    packed_float3 DiffuseAlbedo;
+    float ReservedAlbedo;
 };
 struct DenoiseControls
 {
@@ -22,7 +24,7 @@ struct DenoiseControls
     uint GammaCorrection;
     float NormalScale, RelativePlaneScale;
 };
-static_assert(sizeof(DenoisePixel) == 64 && sizeof(DenoiseControls) == 48, "Metal denoising upload ABI");
+static_assert(sizeof(DenoisePixel) == 80 && sizeof(DenoiseControls) == 48, "Metal denoising upload ABI");
 constant uint DenoiseMomentBit = 1, DenoiseGeometryBit = 2, DenoiseMaximumLevels = 5;
 constant uint DenoiseConfigurationError = 1, DenoiseNumericalError = 2;
 constant int DenoiseRadius = 2;
@@ -140,6 +142,8 @@ kernel void ArvoSpatialDenoise(device const DenoisePixel* raw [[buffer(0)]],
     const int x = int(pixel % controls.Width), y = int(pixel / controls.Width), step = 1 << controls.Level;
     const float3 center = controls.Level ? previous[pixel].xyz : float3(raw[pixel].Radiance);
     float3 mean = float3(0);
+    const bool diffuse = raw[pixel].DiffuseAlbedo.x >= 0;
+    float3 albedoSum = 0;
     float accumulated = 0;
     for (int dy = -DenoiseRadius; dy <= DenoiseRadius; ++dy)
     {
@@ -152,12 +156,16 @@ kernel void ArvoSpatialDenoise(device const DenoisePixel* raw [[buffer(0)]],
             if (xx < 0 || xx >= int(controls.Width))
                 continue;
             const uint address = uint(yy) * controls.Width + uint(xx);
+            if (diffuse != (raw[address].DiffuseAlbedo.x >= 0))
+                continue;
             const float3 color = controls.Level ? previous[address].xyz : float3(raw[address].Radiance);
             const float weight = DenoiseKernel(dx) * DenoiseKernel(dy) *
                                  DenoiseWeight(center, color, raw[pixel], raw[address], controls) *
                                  DenoiseGeometry(raw[pixel], raw[address], controls);
             if (!(weight > 0))
                 continue;
+            if (diffuse)
+                albedoSum += weight * float3(raw[address].DiffuseAlbedo);
             const float previousWeight = accumulated;
             accumulated += weight;
             const float retained = previousWeight / accumulated, incoming = weight / accumulated;
@@ -174,6 +182,16 @@ kernel void ArvoSpatialDenoise(device const DenoisePixel* raw [[buffer(0)]],
                     mean[channel] += (color[channel] - mean[channel]) * incoming;
             }
         }
+    }
+    if (diffuse && accumulated > 0)
+    {
+        constexpr float AlbedoFloor = 0.001;
+        const float3 ratio = (float3(raw[pixel].DiffuseAlbedo) + AlbedoFloor) /
+                              (albedoSum / accumulated + AlbedoFloor);
+        const float3 adjusted = mean * ratio;
+        for (uint channel = 0; channel < 3; ++channel)
+            if (isfinite(float(adjusted[channel])))
+                mean[channel] = adjusted[channel];
     }
     if (!(accumulated > 0) || !all(isfinite(mean)))
     {

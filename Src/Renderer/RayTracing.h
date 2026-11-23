@@ -572,6 +572,8 @@ namespace RayTracing
         // must never authorize temporal history across that optical footprint.
         bool PinholeCorrespondence = false;
         std::vector<GeometryGuide> Pixels;
+        // Local spatial reconstruction only. A negative triplet marks an ineligible footprint.
+        std::vector<Float3> DiffuseAlbedo;
     };
     struct GeometryGuideResult
     {
@@ -579,6 +581,7 @@ namespace RayTracing
         GeometryGuideImage Image;
         std::string Error;
     };
+    inline constexpr uint32_t MaximumRayQueryBatch = 1u << 20;
     ARVO_RENDERER_API bool ValidateRayQueries(const std::vector<Ray>& rays, std::string& error);
 
     class ARVO_RENDERER_API CancellationToken
