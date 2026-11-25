@@ -343,7 +343,7 @@ kernel void ArvoTracePixels(
     constant MotionExposure& cameraExposure [[buffer(19)]],
     uint gridIndex [[thread_position_in_grid]],
     uint localIndex [[thread_index_in_threadgroup]],
-    uint3 groupPosition [[threadgroup_position_in_grid]])
+    uint groupPosition [[threadgroup_position_in_grid]])
 {
     SceneGeometryBuffers geometry = {{nodes, primitiveRefs, triangles, spheres,
         constants.NodeCount, constants.TriangleCount, constants.Acceleration},
@@ -492,7 +492,7 @@ kernel void ArvoTracePixels(
                         position, samples, bounce, shadowRays, primitiveTests,
                         interiorMaterial == ~0u ? 0 : materials[interiorMaterial].Optical.w));
                     // Distributed ray tracing follows glossy/specular events only.
-                    // A diffuse vertex receives direct lighting, then ends this walk.
+                    // A diffuse vertexData receives direct lighting, then ends this walk.
                     if (material.Model == MaterialDiffuse || bounce == constants.MaxReflectionBounces) break;
                     const uint dimension = (bounce + 1u) * BounceSeedMultiplier;
                     const SurfaceSample event = SampleSurface(scattering, Sample2D(samples, dimension),
@@ -755,7 +755,7 @@ kernel void ArvoTracePixels(
         value.ReflectionRays.High = reflectionShared[0].y;
         value.PrimitiveTests.Low = primitiveShared[0].x;
         value.PrimitiveTests.High = primitiveShared[0].y;
-        groupStatistics[groupPosition.x] = value;
+        groupStatistics[groupPosition] = value;
     }
 }
 

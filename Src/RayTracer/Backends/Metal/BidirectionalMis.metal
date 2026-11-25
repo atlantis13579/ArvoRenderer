@@ -1,7 +1,7 @@
 // Native Metal complete-path probabilities and MIS. Veach (1997), chapter 10;
 // PBRT 3e, "Bidirectional Path Tracing". Independent of every other backend.
-// All strategies share one generated density per internal vertex. Removing a
-// common per-vertex log factor preserves weights and controls numerical range.
+// All strategies share one generated density per internal vertexData. Removing a
+// common per-vertexData log factor preserves weights and controls numerical range.
 constant uint PathZero = 0, PathArea = 1, PathSolidAngle = 2, PathDirac = 3, PathVolume = 4;
 constant uint PathSurfaceDestination = 0, PathInfiniteDestination = 1, PathVolumeDestination = 2;
 constant uint PathDeltaScattering = 1, PathEndpointNotIntersectable = 2;
@@ -100,13 +100,13 @@ BidirectionalWeights BidirectionalMisWeightsLocal(thread const BidirectionalVert
     float reference[BdptMaximumVertices]{};
     for (uint i = 1; i < count - 1; ++i)
     {
-        BidirectionalVertexPdf vertex = vertices[i];
-        bool forward = PathDensityValid(vertex.Forward), reverse = PathDensityValid(vertex.Reverse);
+        BidirectionalVertexPdf vertexData = vertices[i];
+        bool forward = PathDensityValid(vertexData.Forward), reverse = PathDensityValid(vertexData.Reverse);
         if (forward)
-            reference[i] = PathComparisonLog(vertex.Forward);
+            reference[i] = PathComparisonLog(vertexData.Forward);
         if (reverse)
-            reference[i] = forward ? max(reference[i], PathComparisonLog(vertex.Reverse))
-                                   : PathComparisonLog(vertex.Reverse);
+            reference[i] = forward ? max(reference[i], PathComparisonLog(vertexData.Reverse))
+                                   : PathComparisonLog(vertexData.Reverse);
     }
     BdptProduct light[BdptMaximumStrategies], camera[BdptMaximumStrategies];
     for (uint i = 0; i <= count; ++i)

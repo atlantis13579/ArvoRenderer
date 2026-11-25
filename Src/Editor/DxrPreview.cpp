@@ -107,7 +107,7 @@ public:
         Ray::RenderSettings settings;
         settings.Width = std::max(1u, request.Settings.Width);
         settings.Height = std::max(1u, request.Settings.Height);
-        const bool sponza = IsSponza(request.Scene->Demo);
+        const bool sponza = request.Scene->Demo == DemoId::SponzaAtrium;
         settings.Integrator = sponza
             ? Ray::Algorithm::PathTracing : Ray::Algorithm::RayTracing;
         settings.SamplesPerPixel = PreviewSamples;

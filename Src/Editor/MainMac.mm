@@ -12,7 +12,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <memory>
@@ -31,7 +33,6 @@ using Arvo::Editor::IEditorPresenter;
 using Arvo::Editor::Rect;
 
 constexpr int EditorPanelX = 10;
-constexpr int EditorPanelY = 10;
 constexpr int EditorPanelWidth = 330;
 constexpr int EditorPanelGap = 10;
 constexpr int EditorViewportMargin = 10;
@@ -54,38 +55,23 @@ Rect EditorViewportBounds(int clientWidth, int clientHeight)
     return {left + (availableWidth - width) * 0.5f, top + (availableHeight - height) * 0.5f, width, height};
 }
 
-int BackendSelectionIndex(
-    const std::vector<BackendDescriptor>& backends,
-    const std::string& selectedBackend)
-{
-    for (std::size_t index = 0; index < backends.size(); ++index)
-    {
-        if (backends[index].Id == selectedBackend)
-        {
-            return static_cast<int>(index);
-        }
-    }
-    return 0;
-}
-
-int DemoSelectionIndex(DemoId selectedDemo)
-{
-    const std::vector<DemoDescriptor>& demos =
-        Arvo::Editor::DemoCatalog::Descriptors();
-    for (std::size_t index = 0; index < demos.size(); ++index)
-    {
-        if (demos[index].Id == selectedDemo)
-        {
-            return static_cast<int>(index);
-        }
-    }
-    return 0;
-}
-
 NSString* StringFromUtf8(const std::string& text)
 {
     NSString* converted = [NSString stringWithUTF8String:text.c_str()];
     return converted != nil ? converted : @"Unknown Arvo error";
+}
+
+// Startup diagnostics go to stderr so a launch that never reaches the window
+// server still leaves a trace in the terminal or the system log.
+void ArvoLog(const char* format, ...)
+{
+    std::fputs("[arvo] ", stderr);
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
 }
 
 } // namespace
@@ -204,11 +190,13 @@ NSString* StringFromUtf8(const std::string& text)
         if (presenter == nullptr)
         {
             PresentationError_ = "Metal editor presentation is unavailable.";
+            ArvoLog("startEditor: CreateEditorPresenter returned null");
             return NO;
         }
         if (!presenter->Initialize(self, ClientWidth_, ClientHeight_))
         {
             PresentationError_ = presenter->LastError();
+            ArvoLog("startEditor: presenter Initialize failed: %s", PresentationError_.c_str());
             return NO;
         }
 
@@ -218,7 +206,7 @@ NSString* StringFromUtf8(const std::string& text)
 
         // Metal presents the editor UI on macOS. Scene transport is offline-only;
         // the DX11/DXR realtime preview choices require Windows.
-        const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+        const Arvo::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
         editor->ResizeViewport(
             static_cast<std::uint32_t>(std::max(viewport.Width, 1.0f)),
             static_cast<std::uint32_t>(std::max(viewport.Height, 1.0f)));
@@ -230,25 +218,37 @@ NSString* StringFromUtf8(const std::string& text)
         LastTick_ = std::chrono::steady_clock::now();
         Running_ = YES;
 
-        FrameTimer_ = [[NSTimer alloc]
-            initWithTimeInterval:1.0 / 60.0
+        // NSTimer has no -initWithTimeInterval:target:selector:userInfo:repeats:
+        // instance initializer; that spelling is a class factory. A timer built
+        // with the factory is autoreleased, so retain it for the frame loop.
+        FrameTimer_ = [[NSTimer timerWithTimeInterval:1.0 / 60.0
             target:self
             selector:@selector(frameTimer:)
             userInfo:nil
-            repeats:YES];
+            repeats:YES] retain];
         [[NSRunLoop mainRunLoop] addTimer:FrameTimer_ forMode:NSRunLoopCommonModes];
+        ArvoLog("editor running at %dx%d", ClientWidth_, ClientHeight_);
         return YES;
     }
     catch (const std::exception& exception)
     {
         PresentationError_ = exception.what();
+        ArvoLog("startEditor: exception: %s", PresentationError_.c_str());
+    }
+    catch (NSException* exception)
+    {
+        PresentationError_ = "Objective-C exception: " + std::string([[exception name] UTF8String]) +
+            ": " + std::string([[exception reason] UTF8String]);
+        ArvoLog("startEditor: %s", PresentationError_.c_str());
     }
     catch (...)
     {
         PresentationError_ = "Unknown macOS editor initialization failure.";
+        ArvoLog("startEditor: unknown exception");
     }
-    Presenter_.reset();
-    Editor_.reset();
+    // Partial startup may already have taken ownership of the presenter, the
+    // worker pool and the editor, so unwind through the normal shutdown path.
+    [self stopEditor];
     return NO;
 }
 
@@ -293,7 +293,7 @@ NSString* StringFromUtf8(const std::string& text)
     }
     if (Editor_ != nullptr)
     {
-        const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+        const Arvo::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
         Editor_->ResizeViewport(
             static_cast<std::uint32_t>(std::max(viewport.Width, 1.0f)),
             static_cast<std::uint32_t>(std::max(viewport.Height, 1.0f)));
@@ -323,7 +323,7 @@ NSString* StringFromUtf8(const std::string& text)
         return;
     }
 
-    const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+    const Arvo::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
     if (!Presenter_->BeginFrame(
             Editor_->ViewportImage(),
             Editor_->ViewportRevision(),
@@ -350,6 +350,7 @@ NSString* StringFromUtf8(const std::string& text)
     if (!Presenter_->EndFrame())
     {
         PresentationError_ = Presenter_->LastError();
+        ArvoLog("renderNow: EndFrame failed: %s", PresentationError_.c_str());
         return;
     }
     PresentationError_.clear();
@@ -419,7 +420,7 @@ NSString* StringFromUtf8(const std::string& text)
     MouseButtons_ |= IMGUI_MBUT_LEFT;
     if (Editor_ != nullptr)
     {
-        const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+        const Arvo::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
         Editor_->HandleViewportPointer(
             static_cast<float>(MouseX_),
             static_cast<float>(MouseY_),
@@ -439,7 +440,7 @@ NSString* StringFromUtf8(const std::string& text)
 {
     [self updateMouseFromEvent:event];
     MouseButtons_ |= IMGUI_MBUT_RIGHT;
-    const Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
+    const Arvo::Editor::Rect viewport = EditorViewportBounds(ClientWidth_, ClientHeight_);
     CameraRotateCapture_ = viewport.Contains(
         static_cast<float>(MouseX_),
         static_cast<float>(MouseY_));
@@ -588,6 +589,7 @@ NSString* StringFromUtf8(const std::string& text)
 - (void)applicationDidFinishLaunching:(NSNotification*)notification
 {
     (void)notification;
+    ArvoLog("applicationDidFinishLaunching");
     const NSWindowStyleMask style =
         NSWindowStyleMaskTitled |
         NSWindowStyleMaskClosable |
@@ -611,6 +613,7 @@ NSString* StringFromUtf8(const std::string& text)
     if (![EditorView_ startEditor])
     {
         ExitCode_ = 2;
+        ArvoLog("startup failed: %s", [[EditorView_ startupErrorText] UTF8String]);
         NSAlert* alert = [[NSAlert alloc] init];
         [alert setMessageText:@"Arvo Editor could not start"];
         [alert setInformativeText:[EditorView_ startupErrorText]];

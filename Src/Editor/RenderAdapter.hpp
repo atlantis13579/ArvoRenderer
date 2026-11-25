@@ -48,6 +48,10 @@ struct BackendDescriptor
     BackendPlatform Platform = BackendPlatform::Any;
     std::optional<RayTracing::BackendType> TransportBackend;
     BackendUsage Usage = BackendUsage::Preview;
+    // Raster previews that evaluate the authored physical material set in the
+    // renderer itself (DX11, Metal). Ray-traced previews validate materials
+    // through TransportBackend instead.
+    bool PhysicalMaterialShading = false;
     bool SupportsPreview() const { return Usage != BackendUsage::Offline; }
     bool SupportsOffline() const { return Usage != BackendUsage::Preview; }
 };

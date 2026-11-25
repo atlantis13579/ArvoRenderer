@@ -155,14 +155,8 @@ enum class DemoId
 {
     CornellBox,
     SponzaAtrium,
-    StanfordDragon,
-    SponzaGallery
+    StanfordDragon
 };
-
-[[nodiscard]] constexpr bool IsSponza(DemoId demo)
-{
-    return demo == DemoId::SponzaAtrium || demo == DemoId::SponzaGallery;
-}
 
 struct SceneSnapshot
 {

@@ -116,14 +116,14 @@ MicropolygonVertex MicropolygonPoint(MicropolygonPatch patch, uint row, uint col
         position.y += controls.CameraUpAmplitude.w * sin(angle);
     }
     const float norm = dot(normal, normal);
-    MicropolygonVertex vertex;
-    vertex.Position = float4(position, 0);
-    vertex.Normal = float4(norm > 0 ? normal / sqrt(norm) : float3(0, 0, 1), 0);
-    vertex.Color = patch.Corners[0].Color * fractions.x + patch.Corners[1].Color * fractions.y +
-                   patch.Corners[2].Color * fractions.z;
-    vertex.TexCoord = patch.Corners[0].TexCoord * fractions.x + patch.Corners[1].TexCoord * fractions.y +
-                      patch.Corners[2].TexCoord * fractions.z;
-    return vertex;
+    MicropolygonVertex outVertex;
+    outVertex.Position = float4(position, 0);
+    outVertex.Normal = float4(norm > 0 ? normal / sqrt(norm) : float3(0, 0, 1), 0);
+    outVertex.Color = patch.Corners[0].Color * fractions.x + patch.Corners[1].Color * fractions.y +
+                      patch.Corners[2].Color * fractions.z;
+    outVertex.TexCoord = patch.Corners[0].TexCoord * fractions.x + patch.Corners[1].TexCoord * fractions.y +
+                        patch.Corners[2].TexCoord * fractions.z;
+    return outVertex;
 }
 MicropolygonTriangle MicropolygonGenerate(MicropolygonPatch patch, uint ordinal, uint n,
                                           MicropolygonControls controls)
@@ -176,12 +176,12 @@ kernel void ArvoDiceMicropolygons(constant MicropolygonControls& controls [[buff
     const MicropolygonTriangle triangle =
         MicropolygonGenerate(patches[lo], index - range.x, range.z, controls);
     const uint WordsPerVertex = 16, VerticesPerTriangle = 3;
-    for (uint vertex = 0; vertex < VerticesPerTriangle; ++vertex)
+    for (uint vertexData = 0; vertexData < VerticesPerTriangle; ++vertexData)
     {
-        device uint* words = output + (index * VerticesPerTriangle + vertex) * WordsPerVertex;
-        MicropolygonWrite(words, triangle.Corners[vertex].Position);
-        MicropolygonWrite(words + 4, triangle.Corners[vertex].Normal);
-        MicropolygonWrite(words + 8, triangle.Corners[vertex].Color);
-        MicropolygonWrite(words + 12, triangle.Corners[vertex].TexCoord);
+        device uint* words = output + (index * VerticesPerTriangle + vertexData) * WordsPerVertex;
+        MicropolygonWrite(words, triangle.Corners[vertexData].Position);
+        MicropolygonWrite(words + 4, triangle.Corners[vertexData].Normal);
+        MicropolygonWrite(words + 8, triangle.Corners[vertexData].Color);
+        MicropolygonWrite(words + 12, triangle.Corners[vertexData].TexCoord);
     }
 }

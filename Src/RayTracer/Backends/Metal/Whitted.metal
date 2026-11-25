@@ -410,7 +410,7 @@ kernel void ArvoTracePixels(
     device atomic_uint* instanceError [[buffer(15)]],
     uint gridIndex [[thread_position_in_grid]],
     uint localIndex [[thread_index_in_threadgroup]],
-    uint3 groupPosition [[threadgroup_position_in_grid]])
+    uint groupPosition [[threadgroup_position_in_grid]])
 {
     const SceneGeometryBuffers geometry = {{nodes, primitiveRefs, triangles, spheres,
         constants.NodeCount, constants.TriangleCount, constants.Acceleration},
@@ -765,7 +765,7 @@ kernel void ArvoTracePixels(
         value.ReflectionRays.High = reflectionShared[0].y;
         value.PrimitiveTests.Low = primitiveShared[0].x;
         value.PrimitiveTests.High = primitiveShared[0].y;
-        groupStatistics[groupPosition.x] = value;
+        groupStatistics[groupPosition] = value;
     }
 }
 

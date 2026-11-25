@@ -160,11 +160,11 @@ RayData Ray(float3 origin, float3 direction, float maximum = MaximumRayDistance)
 {
     return {origin, direction, RayEpsilon, maximum};
 }
-float3 Offset(PathVertex vertex, float3 direction)
+float3 Offset(PathVertex vertexData, float3 direction)
 {
-    if (vertex.Kind == VolumeKind) return float3(vertex.Position);
-    float3 geometry = float3(vertex.Geometry);
-    return float3(vertex.Position) + geometry * (dot(geometry, direction) >= 0 ? RayEpsilon : -RayEpsilon);
+    if (vertexData.Kind == VolumeKind) return float3(vertexData.Position);
+    float3 geometry = float3(vertexData.Geometry);
+    return float3(vertexData.Position) + geometry * (dot(geometry, direction) >= 0 ? RayEpsilon : -RayEpsilon);
 }
 float LinearChannel(uint channel)
 {
@@ -202,30 +202,30 @@ float3 HitColor(TransportContext context, HitData hit)
                                LoadTexel(context, texture, column + 1, row + 1), fract(x)),
                            fract(y));
 }
-SurfaceBsdf ScatteringFrame(TransportContext context, PathVertex vertex, float3 view, uint mode)
+SurfaceBsdf ScatteringFrame(TransportContext context, PathVertex vertexData, float3 view, uint mode)
 {
     HitData hit{};
-    float3 normal = float3(vertex.Normal), geometry = float3(vertex.Geometry);
+    float3 normal = float3(vertexData.Normal), geometry = float3(vertexData.Geometry);
     hit.Normal = dot(normal, view) < 0 ? -normal : normal;
     hit.GeometricNormal = geometry;
     hit.FrontFace = dot(geometry, view) > 0;
-    PackedMaterial material = context.Materials[vertex.Material];
+    PackedMaterial material = context.Materials[vertexData.Material];
     if (material.Model == MaterialLegacy)
         material.Model = MaterialDiffuse;
-    return MakeSurfaceBsdf(material, hit, view, float3(vertex.Color), context.Frame->TransportFlags, mode);
+    return MakeSurfaceBsdf(material, hit, view, float3(vertexData.Color), context.Frame->TransportFlags, mode);
 }
-SurfaceEvaluation Evaluate(TransportContext context, PathVertex vertex, float3 view, float3 direction,
+SurfaceEvaluation Evaluate(TransportContext context, PathVertex vertexData, float3 view, float3 direction,
                            uint mode)
 {
-    if (vertex.Kind == VolumeKind)
+    if (vertexData.Kind == VolumeKind)
     {
         float phase = SubsurfacePhase(dot(-view, direction),
-                                      context.Materials[vertex.Material].ConductorIndex.w);
+                                      context.Materials[vertexData.Material].ConductorIndex.w);
         float pdf = (context.Frame->TransportFlags & ImportanceBit) ? phase : 1 / (4 * Pi);
         return {float3(phase), pdf, pdf};
     }
-    SurfaceEvaluation value = EvaluateSurface(ScatteringFrame(context, vertex, view, mode), direction);
-    PackedMaterial material = context.Materials[vertex.Material];
+    SurfaceEvaluation value = EvaluateSurface(ScatteringFrame(context, vertexData, view, mode), direction);
+    PackedMaterial material = context.Materials[vertexData.Material];
     if (material.Model == MaterialLegacy)
     {
         float probability = 1 - clamp(material.AlbedoReflectivity.w, 0.0f, 1.0f);
@@ -235,21 +235,21 @@ SurfaceEvaluation Evaluate(TransportContext context, PathVertex vertex, float3 v
     }
     return value;
 }
-SurfaceSample Continue(TransportContext context, PathVertex vertex, uint mode, float2 directionU, float lobeU)
+SurfaceSample Continue(TransportContext context, PathVertex vertexData, uint mode, float2 directionU, float lobeU)
 {
-    if (vertex.Kind == VolumeKind)
+    if (vertexData.Kind == VolumeKind)
     {
-        auto phase = SubsurfaceSampleDirection(-float3(vertex.View),
-            context.Materials[vertex.Material].ConductorIndex.w, directionU,
+        auto phase = SubsurfaceSampleDirection(-float3(vertexData.View),
+            context.Materials[vertexData.Material].ConductorIndex.w, directionU,
             (context.Frame->TransportFlags & ImportanceBit) != 0);
         return {phase.Direction, float3(phase.Weight), phase.Pdf, phase.Pdf, 1, ScatteringGlossy};
     }
-    SurfaceBsdf frame = ScatteringFrame(context, vertex, float3(vertex.View), mode);
-    PackedMaterial material = context.Materials[vertex.Material];
+    SurfaceBsdf frame = ScatteringFrame(context, vertexData, float3(vertexData.View), mode);
+    PackedMaterial material = context.Materials[vertexData.Material];
     float mirror = material.Model == MaterialLegacy ? clamp(material.AlbedoReflectivity.w, 0.0f, 1.0f) : 0;
     if (lobeU < mirror)
     {
-        float3 direction = reflect(-float3(vertex.View), frame.Normal);
+        float3 direction = reflect(-float3(vertexData.View), frame.Normal);
         if (!SurfaceDirectionValid(frame, direction, dot(direction, frame.Normal)))
             return {};
         return {direction, float3(SurfaceAdjointCorrection(frame, direction)),
@@ -364,10 +364,10 @@ void Extend(TransportContext context, thread Path& path, RayData ray, float3 bet
                 if (IntersectEmitter(context.Emitters[source], ray, nearest))
                     rectangle = source;
             }
-        PathVertex vertex{};
-        vertex.View = packed_float3(-ray.Direction);
-        vertex.Beta = packed_float3(beta);
-        vertex.Source = InvalidPrimitiveIndex;
+        PathVertex vertexData{};
+        vertexData.View = packed_float3(-ray.Direction);
+        vertexData.Beta = packed_float3(beta);
+        vertexData.Source = InvalidPrimitiveIndex;
         uint slot = path.Begin + path.Count;
         if (path.Count == 1 && found && !hit.FrontFace &&
             context.Materials[hit.MaterialIndex].Optical.w > 0)
@@ -383,11 +383,11 @@ void Extend(TransportContext context, thread Path& path, RayData ray, float3 bet
                 ray.Direction, endpoint, Sample2D(samples, dimension ^ InteriorFlightDimension).x);
             if (flight.Scattered)
             {
-                vertex.Kind = VolumeKind;
-                vertex.Position = packed_float3(ray.Origin + ray.Direction * flight.Distance);
-                vertex.Material = interiorMaterial;
-                vertex.Beta = packed_float3(beta * flight.Weight);
-                if (!all(isfinite(float3(vertex.Position))) || !all(isfinite(float3(vertex.Beta))))
+                vertexData.Kind = VolumeKind;
+                vertexData.Position = packed_float3(ray.Origin + ray.Direction * flight.Distance);
+                vertexData.Material = interiorMaterial;
+                vertexData.Beta = packed_float3(beta * flight.Weight);
+                if (!all(isfinite(float3(vertexData.Position))) || !all(isfinite(float3(vertexData.Beta))))
                 {
                     ReportFailure(context);
                     return;
@@ -395,63 +395,63 @@ void Extend(TransportContext context, thread Path& path, RayData ray, float3 bet
                 ++path.Count;
                 if (path.Count == path.Limit)
                 {
-                    context.Vertices[slot] = vertex;
+                    context.Vertices[slot] = vertexData;
                     return;
                 }
-                auto phase = Continue(context, vertex, path.Mode,
+                auto phase = Continue(context, vertexData, path.Mode,
                                       Sample2D(samples, dimension ^ InteriorPhaseDimension), 0);
-                vertex.Forward = phase.Pdf;
-                vertex.Reverse = phase.ReversePdf;
-                vertex.Event = phase.Event;
-                context.Vertices[slot] = vertex;
+                vertexData.Forward = phase.Pdf;
+                vertexData.Reverse = phase.ReversePdf;
+                vertexData.Event = phase.Event;
+                context.Vertices[slot] = vertexData;
                 if (!(phase.Pdf > 0)) return;
-                beta = float3(vertex.Beta) * phase.Weight;
-                ray = Ray(float3(vertex.Position), phase.Direction);
+                beta = float3(vertexData.Beta) * phase.Weight;
+                ray = Ray(float3(vertexData.Position), phase.Direction);
                 continue;
             }
         }
         if (rectangle != InvalidPrimitiveIndex)
         {
-            vertex.Kind = EmitterKind;
-            vertex.Position = packed_float3(ray.Origin + nearest * ray.Direction);
-            vertex.Geometry = context.Emitters[rectangle].Direction;
-            vertex.Source = rectangle;
+            vertexData.Kind = EmitterKind;
+            vertexData.Position = packed_float3(ray.Origin + nearest * ray.Direction);
+            vertexData.Geometry = context.Emitters[rectangle].Direction;
+            vertexData.Source = rectangle;
         }
         else if (!found)
         {
-            vertex.Kind = InfiniteKind;
-            vertex.Source = SourceIndex(context, InvalidPrimitiveIndex, true);
+            vertexData.Kind = InfiniteKind;
+            vertexData.Source = SourceIndex(context, InvalidPrimitiveIndex, true);
         }
         else
         {
-            vertex.Kind = SurfaceKind;
-            vertex.Position = packed_float3(ray.Origin + hit.Distance * ray.Direction);
-            vertex.Normal = packed_float3(hit.Normal);
-            vertex.Geometry = packed_float3(hit.GeometricNormal);
-            vertex.Material = hit.MaterialIndex;
-            vertex.Color = packed_float3(HitColor(context, hit));
-            vertex.Source = SourceIndex(context, hit.PrimitiveIndex, false);
+            vertexData.Kind = SurfaceKind;
+            vertexData.Position = packed_float3(ray.Origin + hit.Distance * ray.Direction);
+            vertexData.Normal = packed_float3(hit.Normal);
+            vertexData.Geometry = packed_float3(hit.GeometricNormal);
+            vertexData.Material = hit.MaterialIndex;
+            vertexData.Color = packed_float3(HitColor(context, hit));
+            vertexData.Source = SourceIndex(context, hit.PrimitiveIndex, false);
         }
         ++path.Count;
-        if (vertex.Kind != SurfaceKind || path.Count == path.Limit)
+        if (vertexData.Kind != SurfaceKind || path.Count == path.Limit)
         {
-            context.Vertices[slot] = vertex;
+            context.Vertices[slot] = vertexData;
             return;
         }
         uint dimension = domain ^ (path.Count * BounceSeedMultiplier);
-        SurfaceSample next = Continue(context, vertex, path.Mode, Sample2D(samples, dimension),
+        SurfaceSample next = Continue(context, vertexData, path.Mode, Sample2D(samples, dimension),
                                       Sample2D(samples, dimension ^ LobeSelectionScramble).x);
-        vertex.Forward = next.Pdf;
-        vertex.Reverse = next.ReversePdf;
-        vertex.Event = next.Event;
-        context.Vertices[slot] = vertex;
+        vertexData.Forward = next.Pdf;
+        vertexData.Reverse = next.ReversePdf;
+        vertexData.Event = next.Event;
+        context.Vertices[slot] = vertexData;
         if (!next.Event || !(next.Pdf > 0))
             return;
         beta *= next.Weight;
-        ray = Ray(Offset(vertex, next.Direction), next.Direction);
-        if (context.Materials[vertex.Material].Optical.w > 0 &&
+        ray = Ray(Offset(vertexData, next.Direction), next.Direction);
+        if (context.Materials[vertexData.Material].Optical.w > 0 &&
             (next.Event & ScatteringTransmission))
-            interiorMaterial = hit.FrontFace ? vertex.Material : InvalidPrimitiveIndex;
+            interiorMaterial = hit.FrontFace ? vertexData.Material : InvalidPrimitiveIndex;
     }
 }
 Path CameraPath(TransportContext context, uint begin, SampleContext samples, bool owned,
@@ -460,7 +460,7 @@ Path CameraPath(TransportContext context, uint begin, SampleContext samples, boo
     constant FrameConstants& frame = *context.Frame;
     Path path{};
     path.Begin = begin;
-    path.Limit = frame.MaxReflectionBounces + 1 + 2; // First scattering vertex and both endpoints.
+    path.Limit = frame.MaxReflectionBounces + 1 + 2; // First scattering vertexData and both endpoints.
     path.Mode = TransportRadiance;
     float2 jitter = Sample2D(samples, 0);
     path.Raster = CameraPixelRaster(samples.PixelX, samples.PixelY, frame.FullWidth, frame.FullHeight, jitter);

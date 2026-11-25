@@ -45,7 +45,7 @@ private:
     std::string OutputDirectory_;
     std::string Error_;
     int Scroll_ = 0;
-    int Backend_ = 2;
+    int Backend_ = 0;
     int Algorithm_ = 1;
     int Radiometry_ = 0;
     RayTracing::TransportOptions Transport_;

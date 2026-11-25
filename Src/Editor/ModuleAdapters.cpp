@@ -2018,8 +2018,12 @@ void RegisterModuleAdapters(EditorCore& editor)
         }
         else if (!descriptor.TransportBackend && descriptor.Domain == RenderDomain::RealtimeRenderer)
         {
-            adapter = std::make_shared<RealtimeRenderAdapter>(
-                descriptor, Renderer::RHIBackend::DX11);
+            // The raster previews share one adapter; only the RHI differs. Metal
+            // renders offscreen on macOS exactly like DX11 does on Windows.
+            const Renderer::RHIBackend rhi = descriptor.Id == "renderer.metal"
+                ? Renderer::RHIBackend::Metal
+                : Renderer::RHIBackend::DX11;
+            adapter = std::make_shared<RealtimeRenderAdapter>(descriptor, rhi);
         }
         if (adapter && adapter->IsAvailable())
         {

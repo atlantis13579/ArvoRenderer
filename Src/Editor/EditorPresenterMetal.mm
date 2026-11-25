@@ -8,9 +8,12 @@
 #import <CoreGraphics/CoreGraphics.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
+#import <QuartzCore/QuartzCore.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <iterator>
 #include <limits>
 #include <utility>
@@ -244,9 +247,13 @@ struct EditorPresenterMetal::Impl
             return Fail("Metal editor could not allocate the font atlas.");
         }
 
+        // Core Graphics bitmap rows run top-down while the context origin is
+        // bottom-left. Drawing through a flipped AppKit context mirrors every
+        // glyph in memory and parks it in the wrong rows, so the atlas is drawn
+        // unflipped and each cell is positioned with a bottom-up rectangle.
         NSGraphicsContext* graphics = [NSGraphicsContext
             graphicsContextWithCGContext:context
-            flipped:YES];
+            flipped:NO];
         if (graphics == nil)
         {
             CGContextRelease(context);
@@ -288,7 +295,11 @@ struct EditorPresenterMetal::Impl
             glyph.Width = static_cast<float>(glyphWidth);
             glyph.Height = static_cast<float>(FontHeight);
             glyph.Advance = static_cast<float>(glyphWidth);
-            [string drawAtPoint:NSMakePoint(penX, penY) withAttributes:attributes];
+            [string drawInRect:NSMakeRect(
+                penX,
+                AtlasHeight - penY - FontHeight,
+                glyphWidth,
+                FontHeight) withAttributes:attributes];
             ReleaseObject(string);
             penX += glyphWidth + 1;
         }
@@ -958,8 +969,60 @@ struct EditorPresenterMetal::Impl
         }
         [Encoder endEncoding];
         Encoder = nil;
+        const char* dumpPath = std::getenv("ARVO_DUMP_FRAME");
+        id<MTLBuffer> readback = nil;
+        NSUInteger dumpWidth = 0;
+        NSUInteger dumpHeight = 0;
+        NSUInteger dumpBytesPerRow = 0;
+        if (dumpPath != nullptr && Drawable != nil)
+        {
+            dumpWidth = Drawable.texture.width;
+            dumpHeight = Drawable.texture.height;
+            dumpBytesPerRow = dumpWidth * 4u;
+            readback = [Device newBufferWithLength:dumpBytesPerRow * dumpHeight
+                options:MTLResourceStorageModeShared];
+            if (readback != nil)
+            {
+                id<MTLBlitCommandEncoder> blit = [CommandBuffer blitCommandEncoder];
+                [blit copyFromTexture:Drawable.texture
+                    sourceSlice:0
+                    sourceLevel:0
+                    sourceOrigin:MTLOriginMake(0, 0, 0)
+                    sourceSize:MTLSizeMake(dumpWidth, dumpHeight, 1)
+                    toBuffer:readback
+                    destinationOffset:0
+                    destinationBytesPerRow:dumpBytesPerRow
+                    destinationBytesPerImage:dumpBytesPerRow * dumpHeight];
+                [blit endEncoding];
+            }
+        }
         [CommandBuffer presentDrawable:Drawable];
         [CommandBuffer commit];
+        if (readback != nil)
+        {
+            [CommandBuffer waitUntilCompleted];
+            const unsigned char* source = static_cast<const unsigned char*>([readback contents]);
+            if (FILE* file = std::fopen(dumpPath, "wb"))
+            {
+                std::fprintf(file, "P6\n%lu %lu\n255\n",
+                    static_cast<unsigned long>(dumpWidth), static_cast<unsigned long>(dumpHeight));
+                std::vector<unsigned char> row(dumpWidth * 3u);
+                for (NSUInteger y = 0; y < dumpHeight; ++y)
+                {
+                    const unsigned char* pixel = source + y * dumpBytesPerRow;
+                    for (NSUInteger x = 0; x < dumpWidth; ++x)
+                    {
+                        // Drawable pixels are BGRA8.
+                        row[x * 3u + 0u] = pixel[x * 4u + 2u];
+                        row[x * 3u + 1u] = pixel[x * 4u + 1u];
+                        row[x * 3u + 2u] = pixel[x * 4u + 0u];
+                    }
+                    std::fwrite(row.data(), 1u, row.size(), file);
+                }
+                std::fclose(file);
+            }
+            ReleaseObject(readback);
+        }
         ReleaseFrameResources();
         LastError.clear();
         return true;

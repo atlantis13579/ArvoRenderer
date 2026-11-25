@@ -726,8 +726,10 @@ void EditorCore::StartRender()
         if (material.Scattering.Model == RayTracing::MaterialModel::Legacy) continue;
         if (!descriptor.TransportBackend)
         {
-            if (descriptor.Id == "renderer.dx11") continue;
-            StatusText_ = "Physical materials require DX11 or a ray-traced preview";
+            // Raster previews evaluate the physical material set natively, so
+            // they are not restricted to the Cornell Box's authored materials.
+            if (descriptor.PhysicalMaterialShading) continue;
+            StatusText_ = "Physical materials require a raster or ray-traced preview";
             return;
         }
         std::string error;

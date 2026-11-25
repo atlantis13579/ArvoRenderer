@@ -98,7 +98,7 @@ struct VcmWalkVertex
     packed_float3 Outgoing;
     uint Event;
     VcmWideVector Throughput;
-    // Source-vertex Arrival includes its selection PMF. Other arrivals contain
+    // Source-vertexData Arrival includes its selection PMF. Other arrivals contain
     // only the preceding directional law and geometry; no accumulated product.
     VcmNumber Arrival, ReverseArrival, ForwardAngular, ReverseAngular;
     float2 TexCoord;
@@ -155,11 +155,11 @@ bool VcmNonnegative(float3 value)
 }
 VcmWalkVertex VcmEmptyVertex()
 {
-    VcmWalkVertex vertex = {};
-    vertex.Material = vertex.Primitive = vertex.Source = VcmInvalidIndex;
-    vertex.Reserved = VcmInvalidIndex;
-    vertex.Color = packed_float3(float3(1));
-    return vertex;
+    VcmWalkVertex vertexData = {};
+    vertexData.Material = vertexData.Primitive = vertexData.Source = VcmInvalidIndex;
+    vertexData.Reserved = VcmInvalidIndex;
+    vertexData.Color = packed_float3(float3(1));
+    return vertexData;
 }
 float VcmMeanFreePath(VcmScene scene, uint material)
 {
@@ -346,79 +346,79 @@ VcmWalkVertex VcmIntersect(VcmScene scene, RayData ray, thread VcmWalkStatistics
         rectangle = index;
         limit = distance;
     }
-    VcmWalkVertex vertex = VcmEmptyVertex();
-    vertex.Incoming = packed_float3(-ray.Direction);
+    VcmWalkVertex vertexData = VcmEmptyVertex();
+    vertexData.Incoming = packed_float3(-ray.Direction);
     if (surface && !hit.FrontFace && VcmMeanFreePath(scene, hit.MaterialIndex) > 0)
-        vertex.Reserved = hit.MaterialIndex;
+        vertexData.Reserved = hit.MaterialIndex;
     if (rectangle != VcmInvalidIndex)
     {
-        vertex.Kind = VcmEmitterVertex;
-        vertex.Source = rectangle;
-        vertex.Position = packed_float3(ray.Origin + ray.Direction * limit);
-        vertex.Geometry = packed_float3(VcmUnitVector(float3(scene.Sources[rectangle].Direction)));
-        vertex.FrontFace = dot(float3(vertex.Geometry), ray.Direction) < 0;
-        vertex.Normal = packed_float3(vertex.FrontFace ? float3(vertex.Geometry) : -float3(vertex.Geometry));
+        vertexData.Kind = VcmEmitterVertex;
+        vertexData.Source = rectangle;
+        vertexData.Position = packed_float3(ray.Origin + ray.Direction * limit);
+        vertexData.Geometry = packed_float3(VcmUnitVector(float3(scene.Sources[rectangle].Direction)));
+        vertexData.FrontFace = dot(float3(vertexData.Geometry), ray.Direction) < 0;
+        vertexData.Normal = packed_float3(vertexData.FrontFace ? float3(vertexData.Geometry) : -float3(vertexData.Geometry));
     }
     else if (surface)
     {
-        vertex.Kind = VcmSurfaceVertex;
-        vertex.Position = packed_float3(ray.Origin + ray.Direction * hit.Distance);
-        vertex.Normal = packed_float3(hit.Normal);
-        vertex.Geometry = packed_float3(hit.GeometricNormal);
-        vertex.FrontFace = hit.FrontFace;
-        vertex.Material = hit.MaterialIndex;
-        vertex.Primitive = hit.PrimitiveIndex;
-        vertex.Color = packed_float3(VcmTextureColor(scene, hit));
-        vertex.TexCoord = hit.TexCoord;
-        vertex.HasTexCoord = hit.HasTexCoord;
+        vertexData.Kind = VcmSurfaceVertex;
+        vertexData.Position = packed_float3(ray.Origin + ray.Direction * hit.Distance);
+        vertexData.Normal = packed_float3(hit.Normal);
+        vertexData.Geometry = packed_float3(hit.GeometricNormal);
+        vertexData.FrontFace = hit.FrontFace;
+        vertexData.Material = hit.MaterialIndex;
+        vertexData.Primitive = hit.PrimitiveIndex;
+        vertexData.Color = packed_float3(VcmTextureColor(scene, hit));
+        vertexData.TexCoord = hit.TexCoord;
+        vertexData.HasTexCoord = hit.HasTexCoord;
         for (uint index = 0; index < scene.Controls->SourceCount; ++index)
             if (scene.Sources[index].Primitive == hit.PrimitiveIndex)
             {
-                vertex.Source = index;
+                vertexData.Source = index;
                 break;
             }
     }
     else
     {
-        vertex.Kind = VcmEscapeVertex;
-        vertex.Position = packed_float3(ray.Direction); // Angular endpoint, not a finite point.
+        vertexData.Kind = VcmEscapeVertex;
+        vertexData.Position = packed_float3(ray.Direction); // Angular endpoint, not a finite point.
         for (uint index = 0; index < scene.Controls->SourceCount; ++index)
             if (scene.Sources[index].Kind == PackedEmitterEnvironment)
             {
-                vertex.Source = index;
+                vertexData.Source = index;
                 break;
             }
     }
-    return vertex;
+    return vertexData;
 }
-SurfaceBsdf VcmScatteringFrame(VcmScene scene, VcmWalkVertex vertex, float3 view, uint mode)
+SurfaceBsdf VcmScatteringFrame(VcmScene scene, VcmWalkVertex vertexData, float3 view, uint mode)
 {
     HitData hit = {};
-    hit.Normal = dot(float3(vertex.Normal), view) >= 0 ? float3(vertex.Normal) : -float3(vertex.Normal);
-    hit.GeometricNormal = float3(vertex.Geometry);
+    hit.Normal = dot(float3(vertexData.Normal), view) >= 0 ? float3(vertexData.Normal) : -float3(vertexData.Normal);
+    hit.GeometricNormal = float3(vertexData.Geometry);
     hit.FrontFace = dot(hit.GeometricNormal, view) > 0;
-    PackedMaterial material = scene.Materials[vertex.Material];
+    PackedMaterial material = scene.Materials[vertexData.Material];
     if (material.Model == MaterialLegacy)
         material.Model = MaterialDiffuse;
-    return MakeSurfaceBsdf(material, hit, view, float3(vertex.Color), scene.Controls->TransportFlags, mode);
+    return MakeSurfaceBsdf(material, hit, view, float3(vertexData.Color), scene.Controls->TransportFlags, mode);
 }
-SurfaceSample VcmScatter(VcmScene scene, VcmWalkVertex vertex, uint mode, float2 direction, float branch)
+SurfaceSample VcmScatter(VcmScene scene, VcmWalkVertex vertexData, uint mode, float2 direction, float branch)
 {
-    if (vertex.Kind == VcmVolumeVertex)
+    if (vertexData.Kind == VcmVolumeVertex)
     {
-        const SubsurfaceDirection phase = SubsurfaceSampleDirection(-float3(vertex.Incoming),
-            VcmAnisotropy(scene, vertex.Material), direction,
+        const SubsurfaceDirection phase = SubsurfaceSampleDirection(-float3(vertexData.Incoming),
+            VcmAnisotropy(scene, vertexData.Material), direction,
             (scene.Controls->TransportFlags & ImportanceBit) != 0);
-        return {phase.Direction, VcmInteriorAlbedo(scene, vertex.Material) * phase.Weight,
+        return {phase.Direction, VcmInteriorAlbedo(scene, vertexData.Material) * phase.Weight,
                 phase.Pdf, phase.Pdf, 1, ScatteringGlossy};
     }
-    SurfaceBsdf surface = VcmScatteringFrame(scene, vertex, float3(vertex.Incoming), mode);
-    PackedMaterial material = scene.Materials[vertex.Material];
+    SurfaceBsdf surface = VcmScatteringFrame(scene, vertexData, float3(vertexData.Incoming), mode);
+    PackedMaterial material = scene.Materials[vertexData.Material];
     bool legacy = material.Model == MaterialLegacy;
     float mirror = legacy ? clamp(material.AlbedoReflectivity.w, 0.0f, 1.0f) : 0;
     if (legacy && branch < mirror)
     {
-        float3 outgoing = VcmUnitVector(reflect(-float3(vertex.Incoming), surface.Normal));
+        float3 outgoing = VcmUnitVector(reflect(-float3(vertexData.Incoming), surface.Normal));
         float cosine = dot(surface.Normal, outgoing);
         if (!(cosine > 0) || !SurfaceDirectionValid(surface, outgoing, cosine))
             return {};
@@ -454,52 +454,52 @@ void VcmExtend(VcmScene scene, SampleContext samples, RayData ray, VcmWideVector
         else
             IncrementCounter(statistics.Transport);
         VcmWalkVertex previous = vertices[path.Begin + path.Count - 1];
-        VcmWalkVertex vertex = VcmIntersect(scene, ray, statistics);
+        VcmWalkVertex vertexData = VcmIntersect(scene, ray, statistics);
         if (atomic_load_explicit(scene.Geometry.Error, memory_order_relaxed) != 0)
         {
             path.End = VcmEndError;
             return;
         }
-        if (path.Count == 1 && vertex.Reserved != VcmInvalidIndex)
-            interior = vertex.Reserved;
+        if (path.Count == 1 && vertexData.Reserved != VcmInvalidIndex)
+            interior = vertexData.Reserved;
         if (interior != VcmInvalidIndex)
         {
-            const float endpoint = vertex.Kind == VcmEscapeVertex ? MaximumRayDistance :
-                CameraLength(float3(vertex.Position) - ray.Origin);
+            const float endpoint = vertexData.Kind == VcmEscapeVertex ? MaximumRayDistance :
+                CameraLength(float3(vertexData.Position) - ray.Origin);
             const SubsurfaceFlight flight = SubsurfaceFreeFlight(VcmMeanFreePath(scene, interior),
                 VcmInteriorAlbedo(scene, interior), ray.Direction, endpoint,
                 Sample2D(samples, VcmInteriorFlightDomain ^ ((bounce + 1) * BounceSeedMultiplier)).x);
             if (flight.Scattered)
             {
-                vertex.Kind = VcmVolumeVertex;
-                vertex.Position = packed_float3(ray.Origin + ray.Direction * flight.Distance);
-                vertex.Material = interior;
-                vertex.Primitive = vertex.Source = VcmInvalidIndex;
-                vertex.Normal = vertex.Geometry = packed_float3(float3(0));
-                vertex.FrontFace = 0;
+                vertexData.Kind = VcmVolumeVertex;
+                vertexData.Position = packed_float3(ray.Origin + ray.Direction * flight.Distance);
+                vertexData.Material = interior;
+                vertexData.Primitive = vertexData.Source = VcmInvalidIndex;
+                vertexData.Normal = vertexData.Geometry = packed_float3(float3(0));
+                vertexData.FrontFace = 0;
             }
         }
-        if (!VcmFiniteVector(float3(vertex.Position)) || !VcmFiniteVector(float3(vertex.Normal)) ||
-            !VcmFiniteVector(float3(vertex.Geometry)) || !VcmNonnegative(float3(vertex.Color)))
+        if (!VcmFiniteVector(float3(vertexData.Position)) || !VcmFiniteVector(float3(vertexData.Normal)) ||
+            !VcmFiniteVector(float3(vertexData.Geometry)) || !VcmNonnegative(float3(vertexData.Color)))
         {
             VcmReport(scene, VcmNumericalError);
             path.End = VcmEndError;
             return;
         }
-        vertex.Throughput = throughput;
-        if (vertex.Kind == VcmEscapeVertex)
-            vertex.Arrival = previous.ForwardAngular;
+        vertexData.Throughput = throughput;
+        if (vertexData.Kind == VcmEscapeVertex)
+            vertexData.Arrival = previous.ForwardAngular;
         else if (path.Count == 1 && path.Mode == TransportImportance &&
                  (path.EndpointFlags & EmissionInfinite) != 0)
-            vertex.Arrival =
-                VcmProjectedDiskArrival(path.PositionPdf, float3(vertex.Geometry), ray.Direction);
+            vertexData.Arrival =
+                VcmProjectedDiskArrival(path.PositionPdf, float3(vertexData.Geometry), ray.Direction);
         else
-            vertex.Arrival = VcmEdgeArrival(scene, previous.ForwardAngular, previous, vertex);
+            vertexData.Arrival = VcmEdgeArrival(scene, previous.ForwardAngular, previous, vertexData);
         uint output = path.Begin + path.Count++;
-        vertices[output] = vertex;
-        if (vertex.Kind == VcmEscapeVertex || vertex.Kind == VcmEmitterVertex)
+        vertices[output] = vertexData;
+        if (vertexData.Kind == VcmEscapeVertex || vertexData.Kind == VcmEmitterVertex)
         {
-            path.End = vertex.Kind == VcmEscapeVertex ? VcmEndEscape : VcmEndSource;
+            path.End = vertexData.Kind == VcmEscapeVertex ? VcmEndEscape : VcmEndSource;
             return;
         }
         if (bounce == scene.Controls->MaxReflections)
@@ -508,9 +508,9 @@ void VcmExtend(VcmScene scene, SampleContext samples, RayData ray, VcmWideVector
             return;
         }
         uint dimension = (bounce + 1) * BounceSeedMultiplier;
-        SurfaceSample event = VcmScatter(scene, vertex, path.Mode,
+        SurfaceSample event = VcmScatter(scene, vertexData, path.Mode,
                                          Sample2D(samples, dimension ^
-                                             (vertex.Kind == VcmVolumeVertex ? VcmInteriorPhaseDomain : 0)),
+                                             (vertexData.Kind == VcmVolumeVertex ? VcmInteriorPhaseDomain : 0)),
                                          Sample2D(samples, dimension ^ VcmBranchDomain).x);
         if (event.Event == 0)
         {
@@ -525,26 +525,26 @@ void VcmExtend(VcmScene scene, SampleContext samples, RayData ray, VcmWideVector
             path.End = VcmEndError;
             return;
         }
-        vertex.Outgoing = packed_float3(event.Direction);
-        vertex.Event = event.Event;
-        vertex.ForwardAngular = VcmDensityFromFloat(event.Pdf);
-        vertex.ReverseAngular = VcmDensityFromFloat(event.ReversePdf);
-        vertices[output] = vertex;
-        vertices[output - 1].ReverseArrival = VcmBackArrival(scene, previous, vertex, vertex.ReverseAngular);
+        vertexData.Outgoing = packed_float3(event.Direction);
+        vertexData.Event = event.Event;
+        vertexData.ForwardAngular = VcmDensityFromFloat(event.Pdf);
+        vertexData.ReverseAngular = VcmDensityFromFloat(event.ReversePdf);
+        vertices[output] = vertexData;
+        vertices[output - 1].ReverseArrival = VcmBackArrival(scene, previous, vertexData, vertexData.ReverseAngular);
         throughput = VcmMultiplyColor(throughput, VcmDecodeVector(event.Weight));
         if (VcmBlack(throughput))
         {
             path.End = VcmEndAbsorbed;
             return;
         }
-        float3 origin = float3(vertex.Position);
-        if (vertex.Kind == VcmSurfaceVertex)
+        float3 origin = float3(vertexData.Position);
+        if (vertexData.Kind == VcmSurfaceVertex)
         {
-            SurfaceBsdf surface = VcmScatteringFrame(scene, vertex, float3(vertex.Incoming), path.Mode);
+            SurfaceBsdf surface = VcmScatteringFrame(scene, vertexData, float3(vertexData.Incoming), path.Mode);
             origin = SurfaceOffset(surface, origin, event.Direction);
-            if (VcmMeanFreePath(scene, vertex.Material) > 0 &&
+            if (VcmMeanFreePath(scene, vertexData.Material) > 0 &&
                 (event.Event & ScatteringTransmission) != 0)
-                interior = vertex.FrontFace ? vertex.Material : VcmInvalidIndex;
+                interior = vertexData.FrontFace ? vertexData.Material : VcmInvalidIndex;
         }
         ray = {origin, event.Direction, RayEpsilon, MaximumRayDistance};
     }
@@ -755,21 +755,21 @@ float3 VcmTowardCamera(VcmJoinedPath path, uint index)
         return path.Bridge;
     return float3(VcmJoinedVertex(path, index).Incoming);
 }
-SurfaceEvaluation VcmEvaluateContinuous(VcmScene scene, VcmWalkVertex vertex, float3 view, float3 outgoing,
+SurfaceEvaluation VcmEvaluateContinuous(VcmScene scene, VcmWalkVertex vertexData, float3 view, float3 outgoing,
                                         uint mode)
 {
-    if (vertex.Kind == VcmVolumeVertex)
+    if (vertexData.Kind == VcmVolumeVertex)
     {
         const float phase = SubsurfacePhase(dot(-view, outgoing),
-                                            VcmAnisotropy(scene, vertex.Material));
+                                            VcmAnisotropy(scene, vertexData.Material));
         const float pdf = (scene.Controls->TransportFlags & ImportanceBit) != 0 ?
             phase : 1 / (4 * Pi);
-        return {VcmInteriorAlbedo(scene, vertex.Material) * phase, pdf, pdf};
+        return {VcmInteriorAlbedo(scene, vertexData.Material) * phase, pdf, pdf};
     }
-    if (vertex.Material >= scene.Controls->MaterialCount)
+    if (vertexData.Material >= scene.Controls->MaterialCount)
         return {};
-    SurfaceEvaluation evaluated = EvaluateSurface(VcmScatteringFrame(scene, vertex, view, mode), outgoing);
-    PackedMaterial material = scene.Materials[vertex.Material];
+    SurfaceEvaluation evaluated = EvaluateSurface(VcmScatteringFrame(scene, vertexData, view, mode), outgoing);
+    PackedMaterial material = scene.Materials[vertexData.Material];
     if (material.Model == MaterialLegacy)
     {
         float continuous = 1 - clamp(material.AlbedoReflectivity.w, 0.0f, 1.0f);
@@ -791,21 +791,21 @@ struct VcmSourceMeasure
     VcmNumber Position, Direction, Selection;
     uint Flags;
 };
-VcmSourceMeasure VcmEvaluateSource(VcmScene scene, VcmWalkVertex vertex, float3 outgoing)
+VcmSourceMeasure VcmEvaluateSource(VcmScene scene, VcmWalkVertex vertexData, float3 outgoing)
 {
     VcmSourceMeasure measure = {};
-    if (vertex.Source >= scene.Controls->SourceCount)
+    if (vertexData.Source >= scene.Controls->SourceCount)
     {
         // An authored emissive proxy outside its analytic support has no light
         // sampling strategy. It can still be evaluated as a material hit.
-        if (vertex.Material < scene.Controls->MaterialCount)
-            measure.Value = VcmDecodeVector(scene.Materials[vertex.Material].Emission.xyz);
+        if (vertexData.Material < scene.Controls->MaterialCount)
+            measure.Value = VcmDecodeVector(scene.Materials[vertexData.Material].Emission.xyz);
         return measure;
     }
-    PackedEmitter source = scene.Sources[vertex.Source];
+    PackedEmitter source = scene.Sources[vertexData.Source];
     EmitterEndpointDensity pdf =
-        EmitterEndpointPdf(scene.Sources, scene.Controls->SourceCount, VcmDomain(scene), vertex.Source,
-                           float3(vertex.Geometry), outgoing);
+        EmitterEndpointPdf(scene.Sources, scene.Controls->SourceCount, VcmDomain(scene), vertexData.Source,
+                           float3(vertexData.Geometry), outgoing);
     measure.Position = VcmDensityFromFloat((pdf.Flags & EmissionDeltaPosition) ? 1 : pdf.Position);
     measure.Direction = VcmDensityFromFloat((pdf.Flags & EmissionDeltaDirection) ? 1 : pdf.Direction);
     measure.Selection = VcmDensityFromFloat(pdf.SelectionProbability);
@@ -844,8 +844,8 @@ VcmWeights VcmJoinedWeights(VcmScene scene, VcmJoinedPath path, VcmSourceMeasure
     densities[path.Count - 1].Flags = VcmNotIntersectable; // No random lens-hit estimator.
     for (uint i = 1; i + 1 < path.Count; ++i)
     {
-        VcmWalkVertex vertex = VcmJoinedVertex(path, i);
-        if (vertex.Kind == VcmVolumeVertex)
+        VcmWalkVertex vertexData = VcmJoinedVertex(path, i);
+        if (vertexData.Kind == VcmVolumeVertex)
             densities[i].Flags |= VcmVolumeScattering;
         bool originalLight = i + 1 < path.S;
         bool originalCamera = i >= path.S && path.Count - i < path.T;
@@ -853,14 +853,14 @@ VcmWeights VcmJoinedWeights(VcmScene scene, VcmJoinedPath path, VcmSourceMeasure
         {
             // Unchanged events keep sampled Snell/mirror directions and branch
             // masses. Reconstructing them from offset hit positions is incorrect.
-            densities[i].Forward = originalLight ? vertex.ForwardAngular : vertex.ReverseAngular;
-            densities[i].Reverse = originalLight ? vertex.ReverseAngular : vertex.ForwardAngular;
-            if ((vertex.Event & ScatteringDelta) != 0)
+            densities[i].Forward = originalLight ? vertexData.ForwardAngular : vertexData.ReverseAngular;
+            densities[i].Reverse = originalLight ? vertexData.ReverseAngular : vertexData.ForwardAngular;
+            if ((vertexData.Event & ScatteringDelta) != 0)
                 densities[i].Flags |= VcmDelta;
         }
         else
         {
-            SurfaceEvaluation evaluated = VcmEvaluateContinuous(scene, vertex, VcmTowardCamera(path, i),
+            SurfaceEvaluation evaluated = VcmEvaluateContinuous(scene, vertexData, VcmTowardCamera(path, i),
                                                                 VcmTowardLight(path, i), TransportRadiance);
             densities[i].Forward = VcmDensityFromFloat(evaluated.ReversePdf);
             densities[i].Reverse = VcmDensityFromFloat(evaluated.Pdf);
@@ -1119,7 +1119,7 @@ VcmContribution VcmCouple(VcmScene scene, device const VcmWalkVertex* vertices, 
 }
 
 // Fixed buffer slots match the planned Metal VCM RHI. Scene resources are
-// immutable; each lane owns one path and its entire bounded vertex range.
+// immutable; each lane owns one path and its entire bounded vertexData range.
 kernel void ArvoVcmCameraWalks(
     device const PackedAccelerationNode* nodes [[buffer(0)]], device const uint* references [[buffer(1)]],
     device const PackedTriangle* triangles [[buffer(2)]], device const PackedSphere* spheres [[buffer(3)]],
@@ -1453,17 +1453,17 @@ uint VcmLowerBound(device const VcmIndexEntry* index, uint capacity, VcmIndexEnt
     uint first = 0, count = capacity;
     while (count)
     {
-        uint half = count / 2, middle = first + half;
+        uint halfCount = count / 2, middle = first + halfCount;
         VcmIndexEntry entry = index[middle];
         bool less =
             entry.Valid && (kind == VcmSpatialIndex ? VcmCellCompare(entry, key) < 0 : entry.Key < key.Key);
         if (less)
         {
             first = middle + 1;
-            count -= half + 1;
+            count -= halfCount + 1;
         }
         else
-            count = half;
+            count = halfCount;
     }
     return first;
 }
@@ -1522,7 +1522,7 @@ kernel void ArvoVcmBuildGrid(constant VcmSceneControls& c [[buffer(6)]],
     index[slot] = {};
     if (slot >= f.LightCount * f.SlotsPerLight)
         return;
-    uint ordinal = slot / f.SlotsPerLight, vertex = slot % f.SlotsPerLight + 1;
+    uint ordinal = slot / f.SlotsPerLight, vertexData = slot % f.SlotsPerLight + 1;
     VcmWalk path = paths[f.LightBegin + ordinal];
     if (path.Begin > coupling.VertexCapacity || path.Count > coupling.VertexCapacity - path.Begin)
     {
@@ -1535,25 +1535,25 @@ kernel void ArvoVcmBuildGrid(constant VcmSceneControls& c [[buffer(6)]],
         VcmFrameError(errors, VcmControlError);
         return;
     }
-    if (vertex >= path.Count || (vertices[path.Begin + vertex].Kind != VcmSurfaceVertex &&
-                                 vertices[path.Begin + vertex].Kind != VcmVolumeVertex))
+    if (vertexData >= path.Count || (vertices[path.Begin + vertexData].Kind != VcmSurfaceVertex &&
+                                 vertices[path.Begin + vertexData].Kind != VcmVolumeVertex))
         return;
     VcmIndexEntry entry = {};
-    if (!VcmGridCell(float3(vertices[path.Begin + vertex].Position), VcmGridExponent(c, coupling.Radius),
+    if (!VcmGridCell(float3(vertices[path.Begin + vertexData].Position), VcmGridExponent(c, coupling.Radius),
                      entry))
     {
         VcmFrameError(errors, VcmNumericalError);
         return;
     }
     entry.Path = f.LightBegin + ordinal;
-    entry.Vertex = vertex;
+    entry.Vertex = vertexData;
     entry.Identity = ordinal;
     entry.Valid = 1;
     index[slot] = entry;
 }
 // Batcher (1968), "Sorting networks and their applications". Each invocation
 // owns one disjoint compare/exchange pair; a dispatch boundary separates network
-// levels. Identity and vertex break ties, making reduction independent of lanes.
+// levels. Identity and vertexData break ties, making reduction independent of lanes.
 kernel void ArvoVcmSortIndex(device atomic_uint* errors [[buffer(11)]],
                              constant VcmFrameControls& f [[buffer(16)]],
                              device VcmIndexEntry* index [[buffer(17)]],
@@ -1666,14 +1666,14 @@ void VcmAdvanceCamera(VcmScene scene, device const VcmWalkVertex* vertices, devi
                 state.Phase = VcmCameraDone;
                 continue;
             }
-            VcmWalkVertex vertex = vertices[camera.Begin + state.MergeT - 1];
-            if (vertex.Kind != VcmSurfaceVertex && vertex.Kind != VcmVolumeVertex)
+            VcmWalkVertex vertexData = vertices[camera.Begin + state.MergeT - 1];
+            if (vertexData.Kind != VcmSurfaceVertex && vertexData.Kind != VcmVolumeVertex)
             {
                 ++state.MergeT;
                 continue;
             }
             VcmIndexEntry cell = {};
-            if (!VcmGridCell(float3(vertex.Position), VcmGridExponent(*scene.Controls, coupling.Radius),
+            if (!VcmGridCell(float3(vertexData.Position), VcmGridExponent(*scene.Controls, coupling.Radius),
                              cell))
             {
                 VcmReport(scene, VcmNumericalError);
@@ -1794,7 +1794,7 @@ kernel void ArvoVcmProjectLightPaths(
     if (slot >= f.LightCount * f.SlotsPerLight)
         return;
     splats[slot] = {};
-    uint identity = slot / f.SlotsPerLight, vertex = slot % f.SlotsPerLight + 1;
+    uint identity = slot / f.SlotsPerLight, vertexData = slot % f.SlotsPerLight + 1;
     VcmWalk light = paths[f.LightBegin + identity];
     VcmScene scene = {{{nodes, references, triangles, spheres, controls.NodeCount, controls.TriangleCount,
                         controls.Acceleration},
@@ -1809,15 +1809,15 @@ kernel void ArvoVcmProjectLightPaths(
                       &controls};
     if (!VcmFramePath(scene, light, identity, TransportImportance, input, f))
         return;
-    if (vertex >= light.Count || (vertices[light.Begin + vertex].Kind != VcmSurfaceVertex &&
-                                  vertices[light.Begin + vertex].Kind != VcmVolumeVertex))
+    if (vertexData >= light.Count || (vertices[light.Begin + vertexData].Kind != VcmSurfaceVertex &&
+                                  vertices[light.Begin + vertexData].Kind != VcmVolumeVertex))
         return;
     VcmWalkDispatch dispatch = {};
     dispatch.Pass = f.Pass;
     dispatch.LightPopulation = f.LightCount;
     float2 lens = Sample2D(VcmSamples(scene, dispatch, identity, TransportImportance),
-                           VcmLensConnectionDomain ^ (vertex * BounceSeedMultiplier));
-    VcmCouplingQuery query = {f.LightBegin + identity, 0, vertex + 1, 1, 0, 0, lens};
+                           VcmLensConnectionDomain ^ (vertexData * BounceSeedMultiplier));
+    VcmCouplingQuery query = {f.LightBegin + identity, 0, vertexData + 1, 1, 0, 0, lens};
     VcmCouplingControls coupling = VcmFrameCoupling(controls, input, f);
     VcmWalkStatistics stats = {};
     VcmContribution value = VcmCouple(scene, vertices, light, {}, query, coupling, stats);
@@ -1833,10 +1833,10 @@ kernel void ArvoVcmProjectLightPaths(
     if (!VcmCropPixel(controls, f, fullPixel, pixel))
         return;
     splats[slot] = {VcmScaleColor(value.Radiance, WideMath::Divide(VcmOne(), coupling.LightTracingSamples)),
-                    fullPixel, identity, vertex, 1};
+                    fullPixel, identity, vertexData, 1};
     VcmIndexEntry entry = {};
     entry.Path = slot;
-    entry.Vertex = vertex;
+    entry.Vertex = vertexData;
     entry.Identity = identity;
     entry.Key = fullPixel;
     entry.Valid = 1;

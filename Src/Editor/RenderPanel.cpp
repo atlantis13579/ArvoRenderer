@@ -1,4 +1,5 @@
 #include "Core/Paths.h"
+#include "Editor/RenderAdapter.hpp"
 #include "Editor/RenderPanel.h"
 #include "Editor/Imgui.h"
 #include "Editor/ModuleAdapters.h"
@@ -6,6 +7,7 @@
 #include "Renderer/MicropolygonData.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -20,6 +22,31 @@ constexpr RayTracing::BackendType WorkerBackends[] = {
     RayTracing::BackendType::CPU, RayTracing::BackendType::CUDA,
     RayTracing::BackendType::ComputeShader, RayTracing::BackendType::Metal, RayTracing::BackendType::DXR};
 static_assert(std::size(BackendIds) == std::size(WorkerBackends) + 1);
+// Offline worker backends exist only for the APIs their host platform ships.
+struct WorkerBackendOption
+{
+    const char* Label;
+    BackendPlatform Platform;
+};
+constexpr WorkerBackendOption WorkerBackendOptions[] = {
+    {"CPU", BackendPlatform::Any},
+    {"CUDA", BackendPlatform::Windows},
+    {"Compute Shader", BackendPlatform::Windows},
+    {"Metal", BackendPlatform::Apple},
+    {"DXR", BackendPlatform::Windows},
+    {"Per server (auto)", BackendPlatform::Any}};
+static_assert(std::size(WorkerBackendOptions) == std::size(BackendIds));
+[[nodiscard]] bool WorkerBackendSupportedOn(std::size_t index, HostPlatform platform) noexcept
+{
+    const BackendPlatform required = WorkerBackendOptions[index].Platform;
+    return required == BackendPlatform::Any ||
+        (required == BackendPlatform::Windows && platform == HostPlatform::Windows) ||
+        (required == BackendPlatform::Apple && platform == HostPlatform::Apple);
+}
+[[nodiscard]] bool WorkerBackendSupported(std::size_t index) noexcept
+{
+    return index < std::size(WorkerBackendOptions) && WorkerBackendSupportedOn(index, CurrentHostPlatform());
+}
 RayTracing::TransportOptions TransportFor(RayTracing::Algorithm algorithm, RayTracing::TransportOptions options)
 {
     if (algorithm == RayTracing::Algorithm::PointBasedGlobalIllumination)
@@ -993,10 +1020,29 @@ void RenderPanel::Draw(EditorCore& editor, int height)
     if (!progress.Error.empty()) DrawMessage(progress.Error);
     if (!Error_.empty()) DrawMessage(Error_);
     imguiSeparatorLine();
-    const char* backendLabels[] = {"CPU", "CUDA", "Compute Shader", "Metal", "DXR", "Per server (auto)"};
-    static_assert(std::size(backendLabels) == std::size(BackendIds));
     const char* resolutions[] = {"1280 x 720", "1920 x 1080", "3840 x 2160 (4K)"};
-    imguiCombo("Worker backend", &Backend_, backendLabels, static_cast<int>(std::size(backendLabels)), !running);
+    // Only the offline backends the host platform can provide are offered; the
+    // combo index maps back to the stable BackendIds / WorkerBackends order.
+    std::vector<const char*> backendLabels;
+    std::vector<int> backendIndices;
+    for (std::size_t index = 0; index < std::size(WorkerBackendOptions); ++index)
+    {
+        if (!WorkerBackendSupported(index)) continue;
+        backendLabels.push_back(WorkerBackendOptions[index].Label);
+        backendIndices.push_back(static_cast<int>(index));
+    }
+    int displayedBackend = 0;
+    for (std::size_t slot = 0; slot < backendIndices.size(); ++slot)
+        if (backendIndices[slot] == Backend_) displayedBackend = static_cast<int>(slot);
+    if (imguiCombo("Worker backend", &displayedBackend, backendLabels.data(),
+                   static_cast<int>(backendLabels.size()), !running))
+    {
+        Backend_ = backendIndices[static_cast<std::size_t>(displayedBackend)];
+    }
+    if (!running && !WorkerBackendSupported(static_cast<std::size_t>(Backend_)))
+    {
+        Backend_ = 0; // CPU is available on every host
+    }
     imguiCombo("Output resolution", &Resolution_, resolutions, 3, !running);
     imguiSlider(adaptiveActive ? "Offline sample limit"
                 : progressive  ? "Offline PPM passes"

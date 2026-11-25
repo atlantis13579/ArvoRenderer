@@ -233,8 +233,8 @@ bool GiConfiguration(GiWorld world, uint population, uint samples)
 }
 float GiDecodeChannel(uint channel)
 {
-    constant float ByteMaximum = 255, SrgbCutoff = 0.04045f, LinearDivisor = 12.92f;
-    constant float Offset = 0.055f, Scale = 1.055f, Exponent = 2.4f;
+    const float ByteMaximum = 255, SrgbCutoff = 0.04045f, LinearDivisor = 12.92f;
+    const float Offset = 0.055f, Scale = 1.055f, Exponent = 2.4f;
     float value = float(channel) / ByteMaximum;
     return value <= SrgbCutoff ? value / LinearDivisor : pow((value + Offset) / Scale, Exponent);
 }
@@ -243,7 +243,7 @@ float3 GiTexel(GiWorld world, PackedTextureDescriptor texture, int2 p)
     int width = int(texture.Width), height = int(texture.Height);
     int x = (p.x % width + width) % width, y = (p.y % height + height) % height;
     uint texel = world.Texels[texture.OffsetTexels + uint(y) * texture.Width + uint(x)];
-    constant uint ByteMask = 0xff, GreenShift = 8, BlueShift = 16;
+    const uint ByteMask = 0xff, GreenShift = 8, BlueShift = 16;
     return float3(GiDecodeChannel(texel & ByteMask), GiDecodeChannel((texel >> GreenShift) & ByteMask),
                   GiDecodeChannel((texel >> BlueShift) & ByteMask));
 }
@@ -732,7 +732,7 @@ GiVector GiCameraRadiance(GiWorld world, GiCache cache, device const GiRadiance*
     const uint x = f.TileX + pixel % f.Width, y = f.TileY + pixel / f.Width;
     SampleContext random = MakeSampleContext(x, y, f.FullWidth, sample, f.TotalSamples, f.SamplingSequence, f.SamplingSeed);
     float2 jitter = Sample2D(random, 0);
-    constant float LargestBelowOne = 0.999999940395355224609375f;
+    const float LargestBelowOne = 0.999999940395355224609375f;
     const float rasterX =
         min(LargestBelowOne, GiNarrow(WideMath::Divide(WideMath::Add(GiFloat(float(x)), GiFloat(jitter.x)),
                                                        GiFloat(float(f.FullWidth)))));

@@ -200,10 +200,10 @@ VcmNumber VcmProposal(thread const VcmVertexPdf* vertices, uint count, VcmStrate
     // Canonical vertices x[0] ... x[n-1] run from source to sensor. A VC cut s
     // samples F[1..s-1] and R[s..n-2]; the endpoint-only strategies extend these
     // ranges to F[n-1] or R[0]. A merge additionally samples physical R[s-1].
-    for (uint vertex = 1; vertex < cut; ++vertex)
-        proposal = VcmIncludeDensity(proposal, vertices[vertex].Forward);
-    for (uint vertex = cut; vertex + 1 < count; ++vertex)
-        proposal = VcmIncludeDensity(proposal, vertices[vertex].Reverse);
+    for (uint vertexData = 1; vertexData < cut; ++vertexData)
+        proposal = VcmIncludeDensity(proposal, vertices[vertexData].Forward);
+    for (uint vertexData = cut; vertexData + 1 < count; ++vertexData)
+        proposal = VcmIncludeDensity(proposal, vertices[vertexData].Reverse);
     if (merging)
     {
         proposal = VcmIncludeDensity(proposal, vertices[cut - 1].Reverse);

@@ -63,17 +63,21 @@ const std::vector<BackendDescriptor>& StandardBackendCatalog()
 {
     static const std::vector<BackendDescriptor> backends = {
         {"renderer.dx11", "DX11 raster preview", RenderDomain::RealtimeRenderer, BackendPlatform::Windows,
-         std::nullopt, BackendUsage::Preview},
+         std::nullopt, BackendUsage::Preview, true},
         {"renderer.dxr", "DXR ray-traced preview", RenderDomain::RealtimeRenderer, BackendPlatform::Windows,
-         RayTracing::BackendType::DXR, BackendUsage::PreviewAndOffline},
+         RayTracing::BackendType::DXR, BackendUsage::PreviewAndOffline, false},
+        // macOS has no DX11/DXR raster path; the Metal RHI is the realtime
+        // raster preview there and renders offscreen like the DX11 one.
+        {"renderer.metal", "Metal raster preview", RenderDomain::RealtimeRenderer, BackendPlatform::Apple,
+         std::nullopt, BackendUsage::Preview, true},
         {"integrator.cpu", "CPU offline", RenderDomain::RayTracing, BackendPlatform::Any,
-         RayTracing::BackendType::CPU, BackendUsage::Offline},
+         RayTracing::BackendType::CPU, BackendUsage::Offline, false},
         {"integrator.cuda", "CUDA offline", RenderDomain::RayTracing, BackendPlatform::Windows,
-         RayTracing::BackendType::CUDA, BackendUsage::Offline},
+         RayTracing::BackendType::CUDA, BackendUsage::Offline, false},
         {"integrator.compute", "Compute offline", RenderDomain::RayTracing, BackendPlatform::Windows,
-         RayTracing::BackendType::ComputeShader, BackendUsage::Offline},
+         RayTracing::BackendType::ComputeShader, BackendUsage::Offline, false},
         {"integrator.metal", "Metal offline", RenderDomain::RayTracing, BackendPlatform::Apple,
-         RayTracing::BackendType::Metal, BackendUsage::Offline}};
+         RayTracing::BackendType::Metal, BackendUsage::Offline, false}};
     return backends;
 }
 
